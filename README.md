@@ -1,6 +1,6 @@
 # NPipeline Skills
 
-Agent skills for working with [NPipeline](https://github.com/npipeline/npipeline) — High-performance, streaming data pipelines for .NET.
+Agent skills for working with [NPipeline](https://github.com/npipeline/npipeline) - a modern .NET library that makes building complex data processing workflows simple and efficient.
 
 ## Install
 
