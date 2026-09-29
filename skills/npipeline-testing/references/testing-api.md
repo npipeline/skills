@@ -10,7 +10,7 @@ dotnet add package NPipeline.Extensions.Testing.AwesomeAssertions
 
 ## PipelineTestHarness<TPipeline>
 
-Fluent builder for integration testing:
+Fluent builder for integration testing. `TPipeline` must be `IPipelineDefinition, new()`.
 
 ```csharp
 var result = await new PipelineTestHarness<MyPipeline>()
@@ -18,117 +18,113 @@ var result = await new PipelineTestHarness<MyPipeline>()
     .WithParameters(dict)                  // Multiple parameters at once
     .WithContextItem("key", value)         // Add to Items dictionary
     .WithExecutionObserver(myObserver)     // Custom execution observer
-    .CaptureErrors()                       // Don't throw on failure — capture errors
+    .CaptureErrors()                       // Don't throw on failure; capture errors
     .RunAsync(cancellationToken);          // Execute and return result
-
-// Result
-var result = await harness.RunAsync();
 ```
+
+The harness owns a `PipelineContext` (accessible as `harness.Context`) and a runner (default `PipelineRunner.Create()`).
 
 ## PipelineExecutionResult
 
 ```csharp
-public sealed record PipelineExecutionResult
-{
-    bool Success
-    TimeSpan Duration
-    IReadOnlyList<Exception> Errors
-    PipelineContext Context
-}
+public record PipelineExecutionResult(
+    bool Success,
+    TimeSpan Duration,
+    IReadOnlyList<Exception> Errors,
+    PipelineContext Context);
 ```
 
-### Assertion Methods (FluentAssertions / AwesomeAssertions)
+### Assertion Methods (both assertion packages)
 
 ```csharp
-// Success/failure assertions
-result.AssertSuccess();                    // Pipeline completed successfully
+result.AssertSuccess();                    // Pipeline completed with no uncaught exception
 result.AssertFailure();                    // Pipeline failed
-
-// Error assertions
 result.AssertNoErrors();                   // No errors recorded
-result.AssertErrorOfType<T>();            // At least one error of type T
-result.AssertErrorCount(3);               // Exact error count
+result.AssertErrorOfType<TException>();    // At least one error of type T
+result.AssertErrorCount(3);                // Exact error count
+result.AssertCompletedWithin(TimeSpan.FromSeconds(5));
 
-// Timing assertions
-result.AssertCompletedWithin(TimeSpan.FromSeconds(5)); // Duration check
+var sink = result.GetSink<InMemorySinkNode<Order>>();  // First matching sink from context
+var items = sink.Items;
 
-// Data extraction
-var sink = result.GetSink<T>();           // Get first InMemorySink<T> from context
-var items = sink.Items;                   // All items that arrived at the sink
-
-// Context inspection
-context.TryGetContextItem<T>("key", out val);
+result.TryGetContextItem<T>("key", out var value);
 ```
+
+The assertion methods are extension methods (`PipelineExecutionResultExtensions`) and do not require either assertion package. The `InMemorySinkNode<T>` helpers (`ShouldHaveReceived`, `ShouldContain`, `ShouldOnlyContain`, and so on) are provided by the FluentAssertions and AwesomeAssertions packages.
 
 ## Testing Nodes
 
 ### InMemorySourceNode<T>
 
-Parameterless, context-backed source for test data. Extension methods on `PipelineBuilder` (from `NPipeline.Extensions.Testing`):
+Context-backed or list-backed source for test data. Extension methods on `PipelineBuilder` (from `NPipeline.Extensions.Testing`):
 
 ```csharp
-// Via builder extension
-builder.AddInMemorySource<Order>(orders);   // IEnumerable<T> - items provided directly
-builder.AddInMemorySource<Order>();         // Uses context to resolve source data
-builder.AddInMemorySourceWithDataFromContext<Order>(context, orders); // Set context data
+builder.AddInMemorySource<Order>(orders);            // Items provided directly
+builder.AddInMemorySource<Order>("orders");          // Named; resolves data from the context
+builder.AddInMemorySourceWithDataFromContext<Order>(context, orders);
+
+// Set the data the parameterless/named source resolves
+context.SetSourceData(orders);
 ```
 
 ### InMemorySinkNode<T>
 
-Collector sink — items are captured internally and accessible via a snapshot:
+Collector sink. It registers itself in the context during execution, so `context.GetSink<T>()` finds it after the run:
 
 ```csharp
-var sink = new InMemorySinkNode<Order>();
-builder.AddInMemorySink<Order>(sink);
+// Add a sink; retrievable from the context after the run
+builder.AddInMemorySink<Order>("results");
 
-// After pipeline runs
-var collected = sink.Items; // IReadOnlyList<Order> (snapshot)
+// Or register it up front against a specific context
+builder.AddInMemorySink<Order>(context);
+
+// After the run
+var sink = context.GetSink<InMemorySinkNode<Order>>();
+var collected = sink.Items;    // IReadOnlyList<Order> (snapshot)
 ```
+
+`InMemorySinkNode<T>` also exposes `Completion`, a `Task<IReadOnlyList<T>>` that completes with the items when the sink finishes.
 
 ### Additional Testing Nodes
 
 | Node | Purpose |
 |---|---|
-| `MockNode<TIn, TOut>` | Delegate-based transform for mocking |
-| `PassThroughTransformNode<TIn, TOut>` | Type casting (no logic) |
-| `ExceptionThrowingNode<TIn>` | Always throws for error path testing |
+| `MockNode<TIn, TOut>` | Delegate-based transform; ctor takes `Func<TIn, PipelineContext, CancellationToken, Task<TOut>>` |
+| `PassThroughTransformNode<TIn, TOut>` | Identity / type-casting transform |
+| `ExceptionThrowingNode<TIn>` | Always throws, for error path testing |
+| `CapturingLogger` | Captures log entries for assertions |
 
 ## Error Capture
 
-Use `CaptureErrors()` on the test harness to capture exceptions instead of throwing them. The harness internally wraps the resilience policy with error-capturing logic:
+`CaptureErrors()` makes the harness capture exceptions instead of letting them fail the run. It wraps whichever policy the run resolves (a node's, the pipeline's, or the context's), so that policy still runs first.
 
 ```csharp
 var result = await new PipelineTestHarness<MyPipeline>()
-    .CaptureErrors(ResilienceDecision.Skip)  // Skip failed items, capture exceptions
+    .CaptureErrors(ResilienceDecision.Skip)  // Apply Skip to captured item failures
     .RunAsync();
 
-// All captured exceptions are available
 result.Errors.Should().Contain(e => e is ValidationException);
-
-// You can also specify the decision per failure type
-var result = await new PipelineTestHarness<MyPipeline>()
-    .CaptureErrors(ResilienceDecision.Retry)  // Retry failures, but still capture
-    .RunAsync();
 ```
 
-The error-capturing mechanism is internal to the test harness — you interact with it via `CaptureErrors()`, not by creating a `CapturingResiliencePolicy` directly.
+`CaptureErrors` accepts any `ResilienceDecision` (default `Skip`); the value becomes the decision the wrapper returns for captured failures. You interact with it through `CaptureErrors()`, not by creating a capturing policy directly.
 
 ## TestPipelineRunner
 
-Simplified runner that returns results directly:
+A helper that runs a pipeline and returns the items collected by an `InMemorySinkNode<T>`. It requires an `IPipelineRunner` in its constructor and a `PipelineContext` at run time.
 
 ```csharp
-var runner = new TestPipelineRunner();
-var (success, result) = await runner.RunAndGetResultAsync<MyPipeline, EnrichedOrder>();
-// result is the collected sink data
+var runner = new TestPipelineRunner(PipelineRunner.Create());
+var result = await runner.RunAndGetResultAsync<MyPipeline, EnrichedOrder>(context);
+// result is IReadOnlyList<EnrichedOrder> from the sink
 ```
+
+The pipeline must register an `InMemorySinkNode<TResult>`; otherwise the runner throws.
 
 ## Testing Best Practices
 
-1. **Unit test nodes directly** — Call `TransformAsync` with controlled inputs.
-2. **Integration test pipelines** — Use `PipelineTestHarness` with `InMemorySource`/`InMemorySink`.
-3. **Test error paths** — Use `CaptureErrors()` on the harness to capture exceptions during execution.
-4. **Use `CaptureErrors()`** — Prevents test from crashing on expected failures.
-5. **Parameterize tests** — Use `[Theory]` with `[InlineData]` for data-driven node testing.
-6. **Mock dependencies** — Use FakeItEasy or Moq for external service dependencies in nodes.
-7. **Name tests clearly** — Convention: `MethodName_Condition_ExpectedBehavior`.
+1. **Unit test nodes directly** — call `TransformAsync` with controlled inputs and `PipelineContext.CreateDefault()`.
+2. **Integration test pipelines** — use `PipelineTestHarness` with in-memory source and sink nodes.
+3. **Test error paths** — use `CaptureErrors()` for expected failures.
+4. **Parameterize tests** — use `[Theory]` with `[InlineData]` for data-driven node testing.
+5. **Mock dependencies** — use FakeItEasy or Moq for external services in nodes.
+6. **Name tests clearly** — `MethodName_Condition_ExpectedBehavior`.

@@ -8,7 +8,7 @@ dotnet add package NPipeline.Extensions.Parallelism
 
 ## Parallel Execution Strategies
 
-Three strategies built on TPL Dataflow with configurable backpressure:
+Three strategies built on `System.Threading.Channels` with configurable backpressure:
 
 | Strategy | Backpressure | Use Case |
 |---|---|---|
@@ -20,28 +20,28 @@ Three strategies built on TPL Dataflow with configurable backpressure:
 
 ```csharp
 public sealed record ParallelOptions(
-    int MaxDegreeOfParallelism,
-    int MaxQueueLength,
-    BoundedQueuePolicy QueuePolicy,
-    int OutputBufferCapacity,
-    bool PreserveOrdering,
-    TimeSpan? MetricsInterval)
+    int? MaxDegreeOfParallelism = null,       // null = Environment.ProcessorCount
+    int? MaxQueueLength = null,               // null = bounded only by upstream
+    BoundedQueuePolicy QueuePolicy = BoundedQueuePolicy.Block,
+    int? OutputBufferCapacity = null,
+    bool PreserveOrdering = true,
+    TimeSpan? MetricsInterval = null,         // default 1 second
+    bool EnableInputWaitTiming = false);
 ```
 
 ### Workload Presets
 
 ```csharp
-// Easiest API — choose a preset
 handle.RunParallel(builder, ParallelWorkloadType.CpuBound);
 handle.RunParallel(builder, ParallelWorkloadType.IoBound);
 ```
 
 | Preset | MaxDoP | Max Queue | Queue Policy | Best For |
 |---|---|---|---|---|
-| `General` | Env.Processors | 1024 | Block | Default catch-all |
-| `CpuBound` | Env.Processors | Env.Processors × 2 | Block | CPU-heavy transforms |
-| `IoBound` | Env.Processors × 4 | 4096 | DropNewest | Network/DB calls |
-| `NetworkBound` | Env.Processors × 8 | 8192 | DropOldest | High-latency external calls |
+| `General` | CPU × 2 | CPU × 4 | Block | Default catch-all |
+| `CpuBound` | CPU | CPU × 2 | Block | CPU-heavy transforms |
+| `IoBound` | CPU × 4 | CPU × 8 | Block | Database, HTTP, file I/O |
+| `NetworkBound` | min(CPU × 8, 100) | 200 | Block | High-latency network calls |
 
 ### Custom Configuration
 
@@ -50,6 +50,10 @@ handle.WithBlockingParallelism(builder,
     maxDegreeOfParallelism: 8,
     maxQueueLength: 2048,
     outputBufferCapacity: 256);
+
+handle.WithUnorderedParallelism(builder,
+    maxDegreeOfParallelism: 8,
+    maxQueueLength: 2048);
 
 handle.WithDropOldestParallelism(builder,
     maxDegreeOfParallelism: 16,
@@ -73,48 +77,66 @@ var options = new ParallelOptions
     MetricsInterval = TimeSpan.FromSeconds(30)
 };
 
-handle.WithParallelism(builder, options, new BlockingParallelStrategy());
+handle.RunParallel(builder, opt => opt
+    .MaxDegreeOfParallelism(8)
+    .MaxQueueLength(50)
+    .BlockOnBackpressure()
+    .OutputBufferCapacity(200)
+    .AllowUnorderedOutput());
 ```
+
+`ParallelOptionsBuilder` also provides `DropOldestOnBackpressure()`, `DropNewestOnBackpressure()`, `EnableInputWaitTiming()`, and `MetricsInterval(TimeSpan)`.
 
 ## Parallel Execution Metrics
 
 When metrics are enabled (via `MetricsInterval`), the strategy tracks:
 
-- `Processed` — Total items processed
-- `Enqueued` — Total items enqueued
-- `DroppedNewest` — Items dropped from newest end (DropNewest strategy)
-- `DroppedOldest` — Items dropped from oldest end (DropOldest strategy)
-- `RetryEvents` — Retry events triggered
-- `ItemsWithRetry` — Distinct items that were retried
-- `MaxItemRetryAttempts` — Highest retry count for any item
+- `Processed` — items processed
+- `Enqueued` — items enqueued
+- `DroppedNewest` — items dropped from the newest end
+- `DroppedOldest` — items dropped from the oldest end
+- `RetryEvents` — retry events triggered
+- `ItemsWithRetry` — distinct items retried
+- `MaxItemRetryAttempts` — highest retry count for any item
 
-```csharp
-var metrics = strategy.GetMetrics();
-Console.WriteLine($"Processed: {metrics.Processed}, Dropped: {metrics.DroppedNewest}");
-```
+When a node uses observability, parallel strategies also publish retry annotations and activity tags.
 
 ## Thread Safety During Parallel Execution
 
 When using parallel strategies:
 
-- **Default profile**: Context dictionaries are `ConcurrentDictionary` — safe for concurrent access.
-- **HighThroughput profile**: Context dictionaries are plain `Dictionary` — NOT thread-safe. Use `IPipelineStateManager` for shared state:
+- **Default profile**: context dictionaries are thread-safe (`ConcurrentDictionary`).
+- **HighThroughput profile**: context dictionaries are plain `Dictionary` and are NOT thread-safe. Use `IPipelineStateManager` for shared state.
 
 ```csharp
-// In your node, use IPipelineStateManager instead of context.Items directly
-public class MyNode : TransformNode<Order, Order>
+public interface IPipelineStateManager
 {
-    private readonly IPipelineStateManager _state;
-
-    public override async Task<Order> TransformAsync(
-        Order item, PipelineContext context, CancellationToken ct)
-    {
-        await _state.UpdateAsync("counter", (int c) => c + 1, ct);
-        return item;
-    }
+    ValueTask CreateSnapshotAsync(PipelineContext context, CancellationToken ct, bool forceFullSnapshot = false);
+    ValueTask<bool> TryRestoreAsync(PipelineContext context, CancellationToken ct);
+    void MarkNodeCompleted(string nodeId, PipelineContext context);
+    void MarkNodeError(string nodeId, PipelineContext context);
 }
 ```
 
+Node restart and node retry don't roll back shared state; call `TryRestoreAsync` from your own recovery logic when a rollback is needed.
+
 ## Ordering
 
-Set `PreserveOrdering = true` to maintain input order in the output stream. Ordering adds overhead from TPL Dataflow's reorder buffer, so disable it when order is not important.
+`PreserveOrdering = true` (the default) keeps input order in the output via a reorder buffer. Set `AllowUnorderedOutput()` to skip the reorder buffer, which removes head-of-line blocking and increases throughput when order is not important.
+
+## Combining with Resilience
+
+Parallel strategies use the same per-item executor as the sequential strategy, so item retry, backoff, the circuit breaker, and `OnItemFailure` behave the same way. Parallel strategies implement `IResumableExecutionStrategy`, so node restart works with them. You don't wrap the strategy yourself; the builder wraps it when restart is enabled for the node:
+
+```csharp
+var transform = builder.AddTransform<MyTransform, In, Out>("transform");
+transform.RunParallel(builder, ParallelWorkloadType.IoBound);
+
+builder.WithResilience(transform, options => options with
+{
+    ItemRetry = ItemRetryOptions.Default with { MaxRetries = 5 },
+    NodeRestart = new NodeRestartOptions { MaxRestarts = 3 },
+});
+```
+
+A restart resumes from the node's checkpoint. With ordered output, each output is delivered exactly once across restarts. With unordered output or a dropping queue policy, delivery is at least once.

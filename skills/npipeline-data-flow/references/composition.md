@@ -33,7 +33,7 @@ Key nodes:
 
 ```csharp
 // The parent pipeline uses the sub-pipeline as a transform
-var source = builder.AddSource<CsvSource, Order>("read");
+var source = builder.AddSource<OrderSource, Order>("read");
 var enrichment = builder.AddComposite<Order, EnrichedOrder, OrderEnrichmentPipeline>("enrich");
 var sink = builder.AddSink<DatabaseSink, EnrichedOrder>("save");
 
@@ -48,23 +48,24 @@ The child pipeline is instantiated fresh for each item (by default, one sub-pipe
 Controls what context is inherited from parent to child pipeline:
 
 ```csharp
-// Inherit everything (preset)
+// Inherit everything (preset). Pass contextConfiguration by name.
 builder.AddComposite<Order, EnrichedOrder, MySubPipeline>(
-    CompositeContextConfiguration.InheritAll);
+    contextConfiguration: CompositeContextConfiguration.InheritAll);
 
-// Custom inheritance
-builder.AddComposite<Order, EnrichedOrder, MySubPipeline>(
-    contextConfiguration: cfg with
-    {
-        InheritParentParameters = true,
-        InheritParentItems = true,
-        InheritParentProperties = true,
-        InheritRunIdentity = true,
-        InheritLineageSink = true,
-        InheritExecutionObserver = true,
-        InheritDeadLetterDecorator = true
-    });
+// Custom inheritance (CompositeContextConfiguration is a mutable class)
+builder.AddComposite<Order, EnrichedOrder, MySubPipeline>(contextConfiguration: new CompositeContextConfiguration
+{
+    InheritParentParameters = true,
+    InheritParentItems = true,
+    InheritParentProperties = true,
+    InheritRunIdentity = true,
+    InheritLineageSink = true,
+    InheritExecutionObserver = true,
+    InheritDeadLetterDecorator = true
+});
 ```
+
+`AddComposite<TIn, TOut, TDefinition>` has the signature `(string? name, CompositeContextConfiguration? contextConfiguration, IServiceProvider? serviceProvider, bool fallbackToParameterlessWhenServiceMissing)`. Pass `contextConfiguration` by name, because the first positional parameter is `name`. An overload also takes `Action<CompositeContextConfiguration>`.
 
 | Configuration Property | Default | Effect |
 |---|---|---|
@@ -82,8 +83,9 @@ Composites can optionally use their own `IServiceProvider` for node resolution:
 
 ```csharp
 builder.AddComposite<Order, EnrichedOrder, MySubPipeline>(
-    serviceProvider: subSp,
-    contextConfig: CompositeContextConfiguration.InheritAll);
+    name: "enrich",
+    contextConfiguration: CompositeContextConfiguration.InheritAll,
+    serviceProvider: subSp);
 ```
 
 When no service provider is specified, the child pipeline uses the same DI container as the parent.

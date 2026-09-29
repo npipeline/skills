@@ -1,8 +1,8 @@
 ---
 name: npipeline-testing
 description: Use when the user wants to test NPipeline nodes or pipelines. Covers unit testing individual nodes, integration testing with PipelineTestHarness, InMemorySourceNode/InMemorySinkNode, error path testing with CaptureErrors(), assertion helpers (FluentAssertions and AwesomeAssertions), and test runner utilities. Use when user mentions "test my pipeline", "unit test", "integration test", "PipelineTestHarness", "mock node", or "assert".
-npipelineVersion: "0.52.0"
-lastVerified: "2026-06-04"
+npipelineVersion: "0.67.0"
+lastVerified: "2026-09-29"
 ---
 
 # NPipeline Testing
@@ -11,11 +11,11 @@ This skill covers testing NPipeline nodes and pipelines: unit tests for individu
 
 ## Workflow
 
-When the user wants to test NPipeline code, determine the testing scope (unit vs. integration), then guide them through using the appropriate test utilities.
+When the user wants to test NPipeline code, determine the testing scope (unit or integration), then guide them through the appropriate test utilities.
 
 ### Phase 1: Unit Testing Individual Nodes
 
-Test nodes in isolation by calling their methods directly — no pipeline infrastructure needed:
+Test nodes in isolation by calling their methods directly. Use `PipelineContext.CreateDefault()` for a context.
 
 ```csharp
 [Fact]
@@ -23,10 +23,10 @@ public async Task ValidateOrder_MissingName_ThrowsValidationException()
 {
     var node = new ValidateOrder();
     var order = new Order { CustomerName = "" };
-    var context = PipelineContext.Default;
+    var context = PipelineContext.CreateDefault();
 
     await Assert.ThrowsAsync<ValidationException>(
-        () => node.TransformAsync(order, context, CancellationToken.None));
+        async () => await node.TransformAsync(order, context, CancellationToken.None));
 }
 
 [Fact]
@@ -34,13 +34,16 @@ public async Task ValidateOrder_ValidInput_ReturnsValidatedOrder()
 {
     var node = new ValidateOrder();
     var order = new Order { CustomerName = "Acme Corp" };
-    var context = PipelineContext.Default;
+    var context = PipelineContext.CreateDefault();
 
     var result = await node.TransformAsync(order, context, CancellationToken.None);
 
     result.ValidatedAt.Should().BeCloseTo(DateTime.UtcNow, TimeSpan.FromSeconds(1));
 }
 ```
+
+> [!IMPORTANT]
+> `TransformAsync` returns `ValueTask<TOut>`. `Assert.ThrowsAsync` needs an `async` lambda that awaits the `ValueTask` (`async () => await node.TransformAsync(...)`). `PipelineContext.Default` does not exist; use `PipelineContext.CreateDefault()`.
 
 ### Phase 2: Integration Testing with PipelineTestHarness
 
@@ -69,7 +72,7 @@ public async Task OrderPipeline_ValidOrders_AllSucceed()
 
 ### Phase 3: Error Path Testing
 
-Test pipeline behavior when nodes fail. Use `CaptureErrors()` to capture exceptions without the harness throwing:
+Use `CaptureErrors()` to capture exceptions without the harness throwing:
 
 ```csharp
 [Fact]
@@ -84,18 +87,20 @@ public async Task Pipeline_TransientError_RetriesAndSucceeds()
 }
 ```
 
+`CaptureErrors()` takes an optional `ResilienceDecision` (default `Skip`). It wraps whichever policy the run resolves, so a pipeline's own policy still runs first.
+
 ### Phase 4: Assertion Helpers
 
-Two assertion libraries are available:
+Two assertion libraries are available (`NPipeline.Extensions.Testing.FluentAssertions` and `.AwesomeAssertions`):
 
 ```csharp
-// FluentAssertions
-result.AssertSuccess().AssertNoErrors().AssertErrorCount(0);
-result.GetSink<EnrichedOrder>().Items.Should().HaveCount(10);
-
-// AwesomeAssertions
 result.AssertSuccess().AssertNoErrors().AssertErrorCount(0);
 result.GetSink<EnrichedOrder>().Items.Should().HaveCount(10);
 ```
 
-Consult `references/testing-api.md` for complete test harness and assertion APIs.
+Consult `references/testing-api.md` for the complete test harness and assertion APIs.
+
+## Next Steps
+
+- For in-memory test nodes and the harness API, see `references/testing-api.md`.
+- For resilience behavior under test, see the `npipeline-resilience` skill.

@@ -24,9 +24,8 @@ The `NodeKind` enum classifies every node in the pipeline graph:
 ### ISourceNode<TOut>
 
 ```csharp
-public interface ISourceNode<TOut> : INode
+public interface ISourceNode<out TOut> : INode
 {
-    IExecutionStrategy ExecutionStrategy { get; set; }
     IDataStream<TOut> OpenStream(PipelineContext context, CancellationToken cancellationToken);
 }
 ```
@@ -36,34 +35,39 @@ Base class: `SourceNode<TOut>` — extend this, implement `OpenStream`.
 ### ITransformNode<TIn, TOut>
 
 ```csharp
-public interface ITransformNode<TIn, TOut> : INode, INodeTypeMetadata
+public interface ITransformNode : INode { }
+
+public interface ITransformNode<in TIn, TOut> : ITransformNode
 {
-    IExecutionStrategy ExecutionStrategy { get; set; }
-    Task<TOut> TransformAsync(TIn item, PipelineContext context, CancellationToken cancellationToken);
+    ValueTask<TOut> TransformAsync(TIn item, PipelineContext context, CancellationToken cancellationToken);
 }
 ```
 
-Base class: `TransformNode<TIn, TOut>` — extend this, implement `TransformAsync`. The base class exposes `InputType` and `OutputType` without reflection. It also implements `IValueTaskTransform<TIn, TOut>` for the allocation-free fast path.
+Base class: `TransformNode<TIn, TOut>` — extend this, implement `TransformAsync`. The base class exposes `InputType` and `OutputType` without reflection.
+
+> [!IMPORTANT]
+> `TransformAsync` returns `ValueTask<TOut>`, not `Task<TOut>`. There is no `IValueTaskTransform` and no `ExecuteValueTaskAsync` to override.
 
 ### IStreamTransformNode<TIn, TOut>
 
 ```csharp
-public interface IStreamTransformNode<TIn, TOut> : IStreamTransformNode, INodeTypeMetadata
+public interface IStreamTransformNode : INode { }
+
+public interface IStreamTransformNode<in TIn, TOut> : IStreamTransformNode
 {
-    IExecutionStrategy ExecutionStrategy { get; set; }
     IAsyncEnumerable<TOut> TransformAsync(
-        IAsyncEnumerable<TIn> input,
+        IAsyncEnumerable<TIn> items,
         PipelineContext context,
         CancellationToken cancellationToken);
 }
 ```
 
-Use when you need to process the entire stream as a whole (e.g., sorting, batching).
+Use when you need to process the entire stream as a whole (e.g., sorting, batching). Unlike the other core interfaces, this one does not implement `INodeTypeMetadata`.
 
 ### ISinkNode<TIn>
 
 ```csharp
-public interface ISinkNode<TIn> : INode
+public interface ISinkNode<in TIn> : INode
 {
     Task ConsumeAsync(IDataStream<TIn> input, PipelineContext context, CancellationToken cancellationToken);
 }
@@ -74,20 +78,27 @@ Base class: `SinkNode<TIn>` — extend this, implement `ConsumeAsync`.
 ### IJoinNode
 
 ```csharp
-public interface IJoinNode : INode, INodeTypeMetadata
-{
-    // Base interface — see KeyedJoinNode, TimeWindowedJoinNode, etc.
-}
+public interface IJoinNode : INode { }
 ```
 
-Joins combine two input streams of types `TIn1` and `TIn2` into an output stream of type `TOut`. Base class: `BaseJoinNode`.
+Joins combine two input streams of types `TIn1` and `TIn2` into an output stream of type `TOut`. Base class: `BaseJoinNode<TKey, TIn1, TIn2, TOut>`.
 
 ### IAggregateNode
 
 ```csharp
-public interface IAggregateNode : INode
+public interface IAggregateNode : INode { }
+```
+
+Base class: `AggregateNode<TIn, TKey, TResult>` or `AdvancedAggregateNode<TIn, TKey, TAccumulate, TResult>`.
+
+### IExecutionStrategyProvider
+
+A node type with an inherent default execution strategy implements this; a strategy configured on the graph with `WithExecutionStrategy` takes precedence.
+
+```csharp
+public interface IExecutionStrategyProvider
 {
-    // Base interface — see AggregateNode<TIn, TKey, TAccumulate, TResult>
+    IExecutionStrategy DefaultExecutionStrategy { get; }
 }
 ```
 
@@ -95,19 +106,20 @@ public interface IAggregateNode : INode
 
 | Node Class | Kind | Purpose |
 |---|---|---|
-| `LambdaNodes.SourceLambdaNode<TOut>` | Source | Inline source from delegate |
-| `LambdaNodes.TransformLambdaNode<TIn, TOut>` | Transform | Inline transform from delegate |
-| `LambdaNodes.SinkLambdaNode<TIn>` | Sink | Inline sink from delegate |
+| `LambdaSourceNode<TOut>` | Source | Inline source from delegate |
+| `LambdaTransformNode<TIn, TOut>` | Transform | Inline sync transform from delegate |
+| `AsyncLambdaTransformNode<TIn, TOut>` | Transform | Inline async transform from delegate |
+| `LambdaSinkNode<TIn>` | Sink | Inline sink from delegate |
+| `FilterNode<T>` | StreamTransform | Passes items satisfying a predicate |
+| `SelectManyNode<TIn, TOut>` | StreamTransform | Expands one item into zero or more |
 | `KeyedJoinNode<TKey, TIn1, TIn2, TOut>` | Join | Key-based equi-join (TKey is first type param) |
 | `TimeWindowedJoinNode<TKey, TIn1, TIn2, TOut>` | Join | Time-windowed join (TKey is first type param) |
 | `AggregateNode<TIn, TKey, TResult>` | Aggregate | Grouped aggregation (TAccumulate = TResult) |
 | `AdvancedAggregateNode<TIn, TKey, TAccumulate, TResult>` | Aggregate | Accumulator ≠ result type |
-| `InMemoryLookupNode<TIn, TKey, TValue, TOut>` | Lookup | In-memory key/value enrichment (internal — use `AddInMemoryLookup`) |
 | `LookupNode<TIn, TKey, TValue, TOut>` | Lookup | Custom lookup transform |
-| `RouteNode<T>` | Route | Conditional routing |
+| `RouteNode<T>` | Route | Conditional routing (use `AddRoute` + `ConnectWhen`) |
 | `BranchNode<T>` | Branch | Side-effect branching |
 | `TapNode<T>` | Tap | Side-channel monitoring |
 | `BatchingNode<T>` | Batch | Groups items (outputs `IReadOnlyCollection<T>`) |
-| `UnbatchingNode<T>` | Batch | Flattens `IEnumerable<T>` back to individual items |
-| `ReadOnlyCollectionUnbatchingNode<T>` | Batch | Flattens `IReadOnlyCollection<T>` back to individual items |
-| `CustomMergeNode<T>` | Transform | Custom stream merging |
+| `UnbatchingNode<T>` / `ReadOnlyCollectionUnbatchingNode<T>` | Batch | Flattens batches back to individual items |
+| `CustomMergeNode<TIn>` | Transform | Custom stream merging |

@@ -7,33 +7,38 @@
 ### PipelineContextConfiguration
 
 ```csharp
-public sealed record PipelineContextConfiguration
+public sealed record PipelineContextConfiguration(
+    IDictionary<string, object>? Parameters = null,
+    IDictionary<string, object>? Items = null,
+    IDictionary<string, object>? Properties = null,
+    IErrorHandlerFactory? ErrorHandlerFactory = null,
+    IResiliencePolicy? ResiliencePolicy = null,
+    IDeadLetterSink? DeadLetterSink = null,
+    ILoggerFactory? LoggerFactory = null,
+    IPipelineTracer? Tracer = null,
+    IObservabilityFactory? ObservabilityFactory = null,
+    ILineageFactory? LineageFactory = null,
+    PipelineOptimizationProfile OptimizationProfile = PipelineOptimizationProfile.Default,
+    CancellationToken CancellationToken = default)
 {
-    // Shared dictionaries
-    IReadOnlyDictionary<string, object>? Parameters  // Read-only, set once at creation
-    IDictionary<string, object>? Items                // Mutable shared state
-    IDictionary<string, object>? Properties           // Extension point
+    public Guid RunId { get; init; }
+    public string? PipelineName { get; init; }
 
-    // Cancellation
-    CancellationToken CancellationToken
-
-    // Optimization profile (controls thread safety model)
-    PipelineOptimizationProfile OptimizationProfile
-
-    // Factory overrides (for DI scenarios)
-    INodeFactory? NodeFactory
-    IPipelineFactory? PipelineFactory
-    IObservabilityFactory? ObservabilityFactory
-    ILineageFactory? LineageFactory
-    IErrorHandlerFactory? ErrorHandlerFactory
-
-    // Static factory methods
     static PipelineContextConfiguration Default { get; }
-    static PipelineContextConfiguration WithParameters(IDictionary<string, object> parameters)
+    static PipelineContextConfiguration WithFactories(IErrorHandlerFactory?, ILineageFactory?, IObservabilityFactory?)
     static PipelineContextConfiguration WithLogging(ILoggerFactory loggerFactory)
+    static PipelineContextConfiguration WithParameters(IDictionary<string, object> parameters)
     static PipelineContextConfiguration WithCancellation(CancellationToken cancellationToken)
+    static PipelineContextConfiguration WithObservability(ILoggerFactory?, IPipelineTracer?)
+    static PipelineContextConfiguration WithErrorHandling(IDeadLetterSink?)
+    static PipelineContextConfiguration WithResilience(IResiliencePolicy resiliencePolicy)
 }
 ```
+
+`RunId` lets a caller correlate the run with an identifier their own system already holds. `PipelineName` overrides the name reported by the pipeline definition.
+
+> [!NOTE]
+> `INodeFactory` and `IPipelineFactory` are not configuration properties. The node factory comes from the runner.
 
 ### Context Dictionaries
 
@@ -43,8 +48,8 @@ public sealed record PipelineContextConfiguration
 | `Items` | Profile-dependent | Mutable key/value store for pipeline-wide state |
 | `Properties` | Profile-dependent | Extension point for framework-level metadata |
 
-**Default profile**: Thread-safe `ConcurrentDictionary` for `Items` and `Properties`.
-**HighThroughput profile**: Pooled `Dictionary` (no locking — user must ensure single-threaded access).
+**Default profile**: thread-safe `ConcurrentDictionary` for `Items` and `Properties`. A caller-supplied `Parameters` dictionary that is not already concurrent is copied; non-concurrent `Items` and `Properties` are wrapped in a synchronized wrapper.
+**HighThroughput profile**: pooled `Dictionary` (no locking; the user must ensure single-threaded access).
 
 ### Context Composition
 
@@ -53,9 +58,9 @@ public sealed record PipelineContextConfiguration
 | Sub-Context | Properties |
 |---|---|
 | `RunIdentity` | `PipelineId`, `RunId`, `PipelineName`, `PipelineStartTimeUtc` |
-| `ExecutionConfiguration` | Retry options, resilience policy, circuit breaker options, parallel execution flag |
+| `ExecutionConfiguration` | Resolved resilience options per node, parallel execution flag |
 | `Observability` | `LoggerFactory`, `Tracer`, `ObservabilityFactory`, `ExecutionObserver` |
-| `NodeEnvironment` | Node execution scope registry, preconfigured nodes, DI ownership flag |
+| `NodeEnvironment` | Node execution scope registry, preconfigured nodes |
 | `Lineage` | Lineage factory, lineage sink, pipeline lineage sink, lineage collector |
 
 ## PipelineRunner
@@ -63,7 +68,7 @@ public sealed record PipelineContextConfiguration
 ### Creating a Runner
 
 ```csharp
-// Simplest — all defaults
+// Simplest: all defaults
 var runner = PipelineRunner.Create();
 
 // With custom dependencies
@@ -77,16 +82,16 @@ var runner = new PipelineRunnerBuilder()
 ### Running a Pipeline
 
 ```csharp
-// No parameters, no cancellation
+// No context (default context created for you)
 await runner.RunAsync<MyPipeline>();
 
-// With parameters
+// With a context
 var context = new PipelineContext(new PipelineContextConfiguration(
     Parameters: new Dictionary<string, object> { ["inputPath"] = "/data/file.csv" }
 ));
 await runner.RunAsync<MyPipeline>(context);
 
-// With a definition instance (constructor-injected parameters)
+// With an already-constructed definition (constructor-injected parameters)
 var definition = new MyPipeline("/data/file.csv");
 await runner.RunAsync(definition, context, cts.Token);
 
@@ -94,20 +99,36 @@ await runner.RunAsync(definition, context, cts.Token);
 await serviceProvider.RunPipelineAsync<MyPipeline>();
 ```
 
+> [!TIP]
+> Under DI, prefer `serviceProvider.CreatePipelineContext(...)` (or `RunPipelineAsync`) over `new PipelineContext()`. A bare context is not wired to the container's logger factory, tracer, observability collector, or execution observers. See `references/di-integration.md`.
+
 ## Optimization Profiles
 
 | Profile | Dictionary Type | Auto-Configured Retry | Analyzer Rules | Use Case |
 |---|---|---|---|---|
-| `Default` | `ConcurrentDictionary` | 3 retries (exp. backoff + jitter) | Suppressed NP9103-9107 | Prototyping, low-medium throughput |
+| `Default` | `ConcurrentDictionary` | Item retry: 3 retries (exp. backoff + full jitter) | Suppressed NP9103-9107 | Prototyping, low-medium throughput |
 | `HighThroughput` | Pooled `Dictionary` | None | All active | Millions of items/second |
 
 ```csharp
 builder.WithOptimizationProfile(PipelineOptimizationProfile.HighThroughput);
 ```
 
+The profile sets the resilience options that `WithResilience(...)` starts from (see `PipelineResilienceOptions.ForProfile`).
+
 ## Pipeline Execution Lifecycle
 
-1. **Build** — `PipelineBuilder.Build()` validates the graph, freezes collections, computes SHA256 hash
-2. **Setup** — `RuntimePipelineBinder` resolves stream contracts, `NodeInstantiationService` creates node instances, `NodeRegistrationPlanner` compiles execution plans
-3. **Execution** — `PipelineExecutionOrchestrator` walks graph in topological order, `NodeExecutor` processes data through each node
-4. **Cleanup** — `PipelineContext.DisposeAsync()` disposes all registered async disposables, returns pooled dictionaries
+1. **Build** — `PipelineBuilder.Build()` validates the graph and freezes collections
+2. **Setup** — the runtime binder resolves stream contracts, the node factory creates instances, and the registration planner compiles execution plans
+3. **Execution** — the orchestrator walks the graph and processes data through each node
+4. **Cleanup** — the run disposes the instances it owns; `PipelineContext.DisposeAsync()` disposes registered async disposables
+
+## Dependency Injection in the Context
+
+```csharp
+// Under DI, create the context from the run's scope so it gets the container's services
+await using var scope = serviceProvider.CreateAsyncScope();
+var runner = scope.ServiceProvider.GetRequiredService<IPipelineRunner>();
+await using var context = scope.ServiceProvider.CreatePipelineContext(
+    PipelineContextConfiguration.WithCancellation(cancellationToken));
+await runner.RunAsync<MyPipeline>(context);
+```

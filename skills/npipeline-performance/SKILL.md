@@ -1,8 +1,8 @@
 ---
 name: npipeline-performance
-description: Use when the user wants to optimize NPipeline pipeline performance. Covers optimization profiles (Default vs HighThroughput), ValueTask fast paths, execution plan caching, execution strategies (Sequential, Batching, Resilient), zero-allocation hot paths, and object pooling. Use when user mentions "optimize", "make it faster", "high throughput", "ValueTask", "execution strategy", "performance profile", or "zero allocation".
-npipelineVersion: "0.52.0"
-lastVerified: "2026-06-04"
+description: Use when the user wants to optimize NPipeline pipeline performance. Covers optimization profiles (Default vs HighThroughput), the ValueTask-native transform API, execution plan caching, execution strategies (Sequential, Batching, parallel), zero-allocation hot paths, and parallel execution with backpressure policies. Use when user mentions "optimize", "make it faster", "high throughput", "ValueTask", "execution strategy", "performance profile", or "zero allocation".
+npipelineVersion: "0.67.0"
+lastVerified: "2026-09-29"
 ---
 
 # NPipeline Performance
@@ -11,7 +11,7 @@ This skill covers optimizing NPipeline pipeline performance: optimization profil
 
 ## Workflow
 
-When the user wants to improve performance, work through these layers from simplest to most involved:
+When the user wants to improve performance, work through these layers from simplest to most involved.
 
 ### Layer 1: Choose the Right Optimization Profile
 
@@ -21,36 +21,34 @@ builder.WithOptimizationProfile(PipelineOptimizationProfile.HighThroughput);
 
 | Profile | Dictionaries | Retries | Memory | Use Case |
 |---|---|---|---|---|
-| `Default` | `ConcurrentDictionary` (thread-safe) | Auto 3 retries + jitter | Higher overhead | Prototyping, low-medium throughput |
+| `Default` | `ConcurrentDictionary` (thread-safe) | Item retry: 3 retries + jitter | Higher overhead | Prototyping, low-medium throughput |
 | `HighThroughput` | Pooled `Dictionary` (zero-lock) | None (explicit only) | Minimal overhead | Millions of items/second |
 
 `HighThroughput` also activates all Roslyn analyzer rules (NP9103-NP9107) for build-time performance checks.
 
-### Layer 2: Use ValueTask Fast Paths
+### Layer 2: Use the ValueTask-Native Transform
 
-Override `ExecuteValueTaskAsync` for synchronous transforms to avoid per-item `Task` allocations:
+`TransformAsync` returns `ValueTask<TOut>`, so a synchronous transform allocates nothing per item. Return `ValueTask.FromResult(...)` for CPU-only work; there is no separate fast-path interface to implement:
 
 ```csharp
-protected override ValueTask<EnrichedOrder> ExecuteValueTaskAsync(
+public override ValueTask<EnrichedOrder> TransformAsync(
     Order item, PipelineContext ctx, CancellationToken ct)
 {
-    var result = Enrich(item); // No async allocation
-    return new ValueTask<EnrichedOrder>(result);
+    var result = Enrich(item); // synchronous work, no allocation
+    return ValueTask.FromResult(result);
 }
 ```
 
-The execution loop checks for `IValueTaskTransform` and uses the fast path directly, eliminating allocations for every item in synchronous transforms.
-
 ### Layer 3: Apply Execution Strategies
 
-Every node has an `IExecutionStrategy` that controls how it processes input:
+How a node runs is configured on the graph, not the node:
 
 | Strategy | When to Use |
 |---|---|
 | `SequentialExecutionStrategy` (default) | Simple, ordered processing |
 | `BatchingExecutionStrategy(batchSize)` | Database bulk inserts, API batch calls |
 | `UnbatchingExecutionStrategy` | Flatten batches back to items |
-| `ResilientExecutionStrategy` | Adds retry/restart/circuit-breaking to another strategy |
+| `ResilientExecutionStrategy` | Applied automatically from `NodeRestart` options; internal |
 
 ```csharp
 handle.WithExecutionStrategy(builder, new BatchingExecutionStrategy(100));
@@ -58,7 +56,7 @@ handle.WithExecutionStrategy(builder, new BatchingExecutionStrategy(100));
 
 ### Layer 4: Add Parallelism
 
-For CPU-bound or I/O-bound workloads, use parallel execution strategies from `NPipeline.Extensions.Parallelism`. See `references/parallelism.md` for full details.
+For CPU-bound or I/O-bound workloads, use parallel execution from `NPipeline.Extensions.Parallelism`. See `references/parallelism.md`.
 
 ### Layer 5: Avoid Common Pitfalls
 

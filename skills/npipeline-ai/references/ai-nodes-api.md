@@ -1,127 +1,164 @@
 # AI Nodes API Reference
 
-## AITransformNode<TIn, TOut>
+## NPipeline.Extensions.AI.Chat
 
-Full conversion: item in → LLM → item out. The LLM generates the entire output from the input.
+### ChatTransformNode<TIn, TOut>
 
-### Registration
+Full conversion: item in, model response deserialized to `TOut`.
 
 ```csharp
-var handle = builder.AddAITransform<MyTransform, Order, EnrichedOrder>(
-    chatClient,
-    options => options
-        .WithPrompt("Extract key fields from this order...")
-        .WithResultMapper((order, enriched) => enriched),
-    "ai-transformer");
+using NPipeline.Extensions.AI.Chat;
+
+var handle = builder.AddChatTransform<Comment, ClassificationResult>(chatClient, options => options
+    .WithSystemPrompt("Classify the comment as Greeting, Question, Complaint, or Spam.")
+    .WithItemTemplate(comment => $"Text: {comment.Text}")
+    .WithNativeStructuredOutput()
+    .WithTemperature(0.1f)
+    .WithMaxOutputTokens(128));
 ```
 
-### AITransformOptions<TIn, TOut>
+### ChatTransformOptions<TIn, TOut>
 
 ```csharp
-var opts = new AITransformOptionsBuilder<Order, Category>()
-    .WithPrompt("Classify: {OrderId} {Amount} → category")
-    .WithSystemMessage("You are an order classification assistant.")
-    .WithTemperature(0.2f)
-    .WithMaxTokens(100)
-    .WithResultMapper((order, category) => new EnrichedOrder(order, category))
-    .Build();
+public sealed record ChatTransformOptions<TIn, TOut>(
+    string? SystemPrompt = null,             // Required
+    Func<TIn, string>? ItemTemplate = null,  // Required
+    float? Temperature = null,
+    int? MaxOutputTokens = null,
+    bool UseNativeStructuredOutput = false,
+    Action<ChatOptions>? ConfigureOptions = null);
 ```
 
-### Prompt Construction
+Builder methods: `WithSystemPrompt`, `WithItemTemplate`, `WithTemperature`, `WithMaxOutputTokens`, `WithNativeStructuredOutput`, `WithConfigureOptions`. `Build()` throws `InvalidOperationException` when the system prompt or item template is missing.
 
-Prompts can include template variables from input items. The engine replaces `{PropertyName}` with the item's property values.
+### ChatEnrichmentNode<TIn, TField>
 
-## AIEnrichNode<TIn, TField>
-
-Augments an existing item with one LLM-derived field. Less destructive than full transform — the original item is preserved.
-
-### Registration
+Augments the original item with a model-derived field. Registered with `AddChatEnrichment<TIn,TField>` and returns a `TransformNodeHandle<TIn,TIn>`.
 
 ```csharp
-var handle = builder.AddAIEnrich<Order, string>(
-    chatClient,
-    options => options
-        .WithPrompt("Summarize this order in one sentence...")
-        .WithResultMapper((order, summary) => order with { Summary = summary }),
-    "summarize-order");
+var handle = builder.AddChatEnrichment<Article, SummaryResult>(chatClient, options => options
+    .WithSystemPrompt("Summarize the article in one sentence.")
+    .WithItemTemplate(article => article.Body)
+    .WithResultMapper((article, result) => article with { Summary = result.Summary }));
 ```
 
-## Batched Variants
+`ResultMapper<TIn,TField>` has the signature `TIn (TIn input, TField result)`.
 
-### AIBatchedTransformNode<TIn, TOut>
+### Batched Variants
 
-Sends batches to the LLM. The transform receives `IReadOnlyList<Order>` and the prompt describes the batch:
+| Method | Node | Input → Output |
+|---|---|---|
+| `AddChatBatchedTransform<TIn,TOut>` | `ChatBatchedTransformNode<TIn,TOut>` | `IReadOnlyCollection<TIn> → IReadOnlyCollection<TOut>` |
+| `AddChatBatchedEnrichment<TIn,TField>` | `ChatBatchedEnrichmentNode<TIn,TField>` | `IReadOnlyCollection<TIn> → IReadOnlyCollection<TIn>` |
+| `AddChatBatchedStreamTransform<TIn,TOut>` | `ChatBatchedStreamTransformNode<TIn,TOut>` | `TIn → TOut` |
+| `AddChatBatchedStreamEnrichment<TIn,TField>` | `ChatBatchedStreamEnrichmentNode<TIn,TField>` | `TIn → TIn` |
 
-```csharp
-var handle = builder.AddAIBatchedTransform<MyBatcher, Order, Category>(
-    chatClient,
-    options => options
-        .WithPrompt("Classify each order in this batch. Return a JSON array of categories.")
-        .WithBatchSize(50),
-    "batch-classify");
-```
+Batched transforms use `WithBatchTemplate(Func<IReadOnlyCollection<TIn>, string>)`. The model must return one result per input item (an object with an `Items` array). Stream-batched variants add `WithBatchSize(int)` and `WithBatchTimeout(TimeSpan)`: they buffer up to the batch size, flush an incomplete batch after the timeout, make one request, and emit individual results.
 
-### AIBatchedEnrichNode<TIn, TField>
+`AddChatBatchedEnrichmentWithUnbatch<T,TField>(chatClient, batchSize, batchTimeout, configure, name?)` builds a batcher, a batched enrichment node, and an unbatcher, returning `(inputHandle, outputHandle)` to connect as a single `T → T` stage.
 
-Batch enrichment — enriches each item in a batch with an LLM-derived field.
+### Exceptions
 
-### Stream Variants
+`ChatTransformException` is raised when a chat node fails (invocation or deserialization).
 
-`AIBatchedStreamTransformNode<TIn, TOut>` and `AIBatchedStreamEnrichNode<TIn, TField>` process the entire stream in one LLM call.
+## NPipeline.Extensions.AI.Decisions
 
-## AIRouteBuilder<T>
-
-Conditional LLM-powered routing — the LLM decides where each item goes:
+### IAIClassifier<TInput, TLabel>
 
 ```csharp
-builder.AddAIRoute<TIn, TField>(chatClient, route => route
-    .WithRoute("priority", "Is this a high-priority order?", RouteMatchMode.FirstMatch)
-    .WithRoute("regular", "Is this a regular order?", RouteMatchMode.FirstMatch)
-    .WithOtherwise("unclassified"));
-```
-
-Two route builder methods available: `AddAIRoute<TIn, TField>` for per-item routing and `AddAIBatchedStreamRoute<TIn, TField>` for batched stream routing.
-
-## AIInvoker
-
-The internal engine handles LLM invocation with retry, response sanitization, JSON deserialization with graceful fallback, and batch count mismatch detection with automatic retry. This is an internal implementation detail — you don't interact with it directly.
-
-## AITransformException
-
-When an AI node fails, the exception carries rich context:
-
-```csharp
-public sealed class AITransformException : PipelineException
+public interface IAIClassifier<in TInput, TLabel>
+    where TLabel : notnull
 {
-    string ErrorCode              // Error code (e.g., "AI_TRANSFORM_ERROR")
-    object? OriginalItem          // The item being processed
-    string? PromptSent            // The prompt that was sent
-    string? ModelUsed             // Which model responded
-    string? RawResponse           // The raw LLM response (for debugging)
+    ValueTask<AIClassification<TLabel>> ClassifyAsync(
+        TInput input,
+        CancellationToken cancellationToken = default);
 }
 ```
 
-## Error Handling
-
-AI nodes throw `AITransformException` on failure. Handle these in resilience policies:
+### AIClassification<TLabel>
 
 ```csharp
-public override Task<ResilienceDecision> DecideItemFailureAsync<TIn, TOut>(...)
+public sealed record AIClassification<TLabel>(
+    TLabel Label,
+    double Confidence,
+    IReadOnlyDictionary<TLabel, double> Probabilities,
+    AIInvocationMetadata Metadata)
+    where TLabel : notnull;
+```
+
+`AIInvocationMetadata` carries `Provider`, `Model`, `RequestId`, and optional `AIUsage` (input/output tokens).
+
+### AddAIRoute<TInput, TLabel>
+
+Adds an `AIClassificationNode<TInput,TLabel>` followed by a confidence-aware route, and returns an `AIRouteBuilder<TInput,TLabel>` that implements `IInputNodeHandle<TInput>`.
+
+```csharp
+var route = builder.AddAIRoute<Ticket, TicketRoute>(classifier, "ticket-route")
+    .WhenLabel(TicketRoute.Billing, billingSink, minimumConfidence: 0.75)
+    .Otherwise(reviewSink);
+
+builder.Connect(source, route);
+```
+
+| Method | Behavior |
+|---|---|
+| `WhenLabel(label, target, minimumConfidence = 0)` | Selected label matches and confidence meets the threshold |
+| `WhenProbability(label, minimumProbability, target)` | Any label's probability meets the threshold (including a nonwinning label) |
+| `When(Func<AIClassification<TLabel>, bool> predicate, target)` | Custom predicate over the full classification |
+| `Otherwise(target)` | Fallback for items matching no branch (one only) |
+| `WithMatchMode(RouteMatchMode)` | `FirstMatch` (default) or `AllMatches` |
+
+Advanced handles: `ClassificationHandle` (sources `AIClassifiedItem<TInput,TLabel>` right after classification) and `RouteHandle`.
+
+`AIClassifiedItem<TInput, TLabel>` is the envelope `(TInput Item, AIClassification<TLabel> Classification)`.
+
+## NPipeline.Extensions.AI.Decisions.Jev
+
+### AddJevRoute<TInput, TLabel>
+
+```csharp
+var route = builder.AddJevRoute<Ticket, TicketRoute>(jevClient, options => options
+        .WithState(ticket => new { ticket.Subject, ticket.Message, ticket.CustomerTier })
+        .WithInstructions("Which team should handle this ticket?")
+        .AddChoice(TicketRoute.Billing, "billing", "Charges, invoices, and refunds")
+        .AddChoice(TicketRoute.Technical, "technical", "Bugs, outages, and integrations")
+        .AddChoice(TicketRoute.Other, "other", "None of the other routes apply"))
+    .WhenLabel(TicketRoute.Billing, billingSink, minimumConfidence: 0.75)
+    .Otherwise(reviewSink);
+```
+
+### JevChoiceClassifierOptionsBuilder<TInput, TLabel>
+
+| Method | Required | Description |
+|---|---|---|
+| `WithState(Func<TInput, object?>)` | Yes | Projects the item into string or structured JSON state (return `JsonNode` for direct control) |
+| `WithInstructions(string)` / `WithInstructions(JsonNode)` | Yes | Text or structured instructions for the Choice question |
+| `AddChoice(label, wireName, description?)` / `AddChoice(label, wireName, JsonNode?)` | At least two | Maps a typed label to the provider wire name and criteria |
+| `WithModel(string)` | No | Overrides the client's default model |
+| `WithQuestionId(string)` | No | Answer correlation key; default `route` |
+
+### JevClient and Options
+
+```csharp
+public sealed class JevClientOptions
 {
-    if (exception is AITransformException aiEx)
-    {
-        _logger.LogWarning("AI failed for item {Item}: {Response}",
-            aiEx.OriginalItem, aiEx.RawResponse);
-        return Task.FromResult(ResilienceDecision.Skip);
-    }
-    return base.DecideItemFailureAsync<TIn, TOut>(...);
+    public string ApiKey { get; init; }                                  // Required
+    public Uri? BaseUri { get; init; }                                   // Default https://api.typesafe.ai
+    public string? DefaultModel { get; init; }                           // Default jev-latest
+    public TimeSpan AttemptTimeout { get; init; } = TimeSpan.FromSeconds(10);
+    public JevRetryPolicy Retry { get; init; } = new();
+    public TimeProvider TimeProvider { get; init; } = TimeProvider.System;
 }
 ```
 
-## Best Practices
+`JevClientOptions.Retry` (`JevRetryPolicy`) defaults to `MaxRetries = 2`, exponential backoff with jitter. Set `MaxRetries = 0` when an NPipeline resilience policy owns retries, to avoid multiplying attempts.
 
-1. **Use batched modes for cost efficiency** — One LLM call per batch of 50 items is cheaper than 50 individual calls.
-2. **Set temperature low** (0.0–0.3) for classification/categorization tasks.
-3. **Use enrichment instead of transform** when adding fields — preserves existing data.
-4. **Handle AI failures gracefully** — LLMs can produce unexpected output. Use resilience policies with `Skip` or `DeadLetter` decisions for AI exceptions.
-5. **Template prompts carefully** — Use `{PropertyName}` syntax for item data injection.
+`JevChoiceClassifier<TInput,TLabel>` returns `AIClassification<TLabel>` with `Provider = "typesafe"`, the concrete response model, request ID, and token usage. It rejects responses that omit the configured answer, return the wrong type, select an unknown wire name, or omit a configured probability.
+
+### Direct System One Evaluation
+
+`IJevClient.EvaluateAsync(state, questions, model?, cancellationToken?)` evaluates several independent questions about one state in a single request. `JevChoiceQuestion`/`JevChoiceAnswer`, `JevScoreQuestion`/`JevScoreAnswer`, and `JevNoulQuestion`/`JevNoulAnswer` cover choice, score, and yes/no judgments.
+
+### Exceptions
+
+`JevApiException` (derived from `AIInvocationException`) is raised for nonretryable or exhausted responses and carries `StatusCode`, `ResponseBody`, `Headers`, `Provider`, `Model`, and `RequestId` without exposing the API key.

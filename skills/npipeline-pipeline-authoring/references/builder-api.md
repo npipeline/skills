@@ -67,16 +67,21 @@ Provided by `PipelineBuilderExtensions`:
 // Source from collection
 builder.AddSource(() => new[] { 1, 2, 3 });
 // Async source
-builder.AddSource(async ct => FetchDataAsync(ct));
+builder.AddSource(async ct => FetchAsync(ct));
 
-// Sync transform (uses ValueTask fast path)
+// Sync transform (returns ValueTask, no allocation)
 builder.AddTransform((string s) => s.ToUpper());
-// Async transform
+// Async transform (ValueTask<TOut>)
 builder.AddTransform(async (item, ct) => await ProcessAsync(item, ct));
+
+// Filter (stream transform; drops items that fail the predicate)
+builder.AddFilter((Order o) => o.Status == "Active");
+// Expand one item into many
+builder.AddSelectMany((Order o) => o.Lines);
 
 // Sync sink
 builder.AddSink((string s) => Console.WriteLine(s));
-// Async sink
+// Async sink (Func<TIn, CancellationToken, ValueTask>)
 builder.AddSink(async (item, ct) => await SaveAsync(item, ct));
 ```
 
@@ -94,11 +99,11 @@ internal TransformNodeHandle<TIn, TOut> AddStreamTransformWithKind<TNode, TIn, T
 ## Connecting Nodes
 
 ```csharp
-// Simple typed connection — compiler enforces matching types
+// Simple typed connection: the compiler enforces matching types
 builder.Connect(sourceHandle, transformHandle);
 builder.Connect(transformHandle, sinkHandle);
 
-// Join connections — overloads match input positions
+// Join connections: overloads match input positions
 builder.Connect(source1, joinHandle); // connects to TIn1
 builder.Connect(source2, joinHandle); // connects to TIn2
 ```
@@ -122,28 +127,29 @@ Typed handles prevent connecting incompatible nodes at compile time:
 ### Resilience and Error Handling
 
 ```csharp
-// Retry options (global)
-builder.WithRetryOptions(o => o with { MaxItemRetries = 3 });
-// Per-node retry
-builder.WithRetryOptions(handle, myRetryOptions);
+// Pipeline-wide resilience options (item retry, node restart, node retry, circuit breaker)
+builder.WithResilience(o => o with { ItemRetry = ItemRetryOptions.Default with { MaxRetries = 3 } });
 
-// Circuit breaker
-builder.WithCircuitBreaker(failureThreshold: 5, openDuration: TimeSpan.FromMinutes(1));
+// Per-node resilience options
+builder.WithResilience(handle, o => o with { NodeRestart = new NodeRestartOptions { MaxRestarts = 2 } });
 
 // Resilience policy
 builder.AddResiliencePolicy<MyPolicy>();
+builder.AddResiliencePolicy(handle, myPolicy);  // per-node
 
 // Dead letter sink
 builder.AddDeadLetterSink<MyDeadLetterSink>();
 ```
 
+See the `npipeline-resilience` skill for the full options model.
+
 ### Execution Strategy (per-node)
 
 ```csharp
-builder.WithExecutionStrategy(handle, new BatchingExecutionStrategy(100));
-// or via handle extension
 handle.WithExecutionStrategy(builder, new BatchingExecutionStrategy(100));
 ```
+
+How a node runs is a property of the graph, not the node. A node type with an inherent default strategy implements `IExecutionStrategyProvider`.
 
 ### Optimization Profile
 
@@ -157,10 +163,18 @@ builder.WithOptimizationProfile(PipelineOptimizationProfile.HighThroughput);
 builder.EnableItemLevelLineage(opts => opts with { SampleEvery = 10 });
 ```
 
+### Validation
+
+```csharp
+builder.WithValidationMode(GraphValidationMode.Error); // Error (default), Warn, or Off
+builder.WithValidationRule(myRule);
+builder.WithoutExtendedValidation();
+```
+
 ## Building
 
 ```csharp
-// Validates graph, throws on error by default
+// Validates the graph, throws PipelineValidationException on error by default
 Pipeline pipeline = builder.Build();
 
 // Non-throwing variant
@@ -170,20 +184,22 @@ if (builder.TryBuild(out var pipeline, out var validationResult))
 }
 else
 {
-    // inspect validationResult.Errors
+    // inspect validationResult.Issues
 }
 ```
 
-`Build()` validates the graph, computes a SHA256 graph hash for execution plan caching, and builds child graphs for any composite nodes.
+`Build()` validates the graph and builds child graphs for any composite nodes. A builder instance can only be built once.
 
 ## Complete Example
 
 ```csharp
+using NPipeline.Pipeline;
+
 public class OrderPipeline : IPipelineDefinition
 {
     public void Define(PipelineBuilder builder, PipelineContext context)
     {
-        var source   = builder.AddSource<CsvSourceNode<Order>, Order>("read-orders");
+        var source   = builder.AddSource<OrderSource, Order>("read-orders");
         var validate = builder.AddTransform<ValidateOrder, Order, Order>("validate");
         var enrich   = builder.AddTransform<EnrichOrder, Order, EnrichedOrder>("enrich");
         var save     = builder.AddSink<DatabaseSink, EnrichedOrder>("save");

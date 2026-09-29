@@ -1,8 +1,8 @@
 ---
 name: npipeline-lineage
 description: Use when the user wants to add data lineage tracking to NPipeline pipelines. Covers LineagePacket, item-level lineage, pipeline-level lineage, LineageService, sampling and redaction, cardinality mapping strategies, correlation trails, terminal outcomes, LoggingPipelineLineageSink, and DI setup with AddNPipelineLineage. Use when user mentions "data lineage", "provenance", "track data", "correlation", or "audit trail".
-npipelineVersion: "0.52.0"
-lastVerified: "2026-06-04"
+npipelineVersion: "0.67.0"
+lastVerified: "2026-09-29"
 ---
 
 # NPipeline Lineage
@@ -25,7 +25,7 @@ Two presets:
 
 | Profile | Sampling | Redaction | Detail | Use Case |
 |---|---|---|---|---|
-| `FastLineage` (default) | 1/100 items | Data redacted | Reduced detail | Production throughput |
+| `FastLineage` (the `LineageOptions.Default`) | 1/100 items | Data redacted | Reduced detail | Production throughput |
 | `CompleteLineage` | 1/1 items | Data preserved | Full detail | Development, diagnostics, compliance |
 
 ```csharp
@@ -36,9 +36,15 @@ builder.EnableItemLevelLineage(LineageOptions.CompleteLineage);
 ### Phase 2: Enable Lineage
 
 ```csharp
-// In the pipeline definition
+// In the pipeline definition. With no argument, CompleteLineage is used.
+builder.EnableItemLevelLineage();
+
+// Or customize
 builder.EnableItemLevelLineage(opts => opts with { SampleEvery = 10 });
 ```
+
+> [!IMPORTANT]
+> Item-level lineage requires the `NPipeline.Extensions.Lineage` package. If the builder was created without a lineage module, `Build()` throws. With DI, call `services.AddNPipelineLineage()`. Without DI, build the runner with `new PipelineRunnerBuilder().UseLineage()`; a runner from `PipelineRunner.Create()` does not track lineage.
 
 ### Phase 3: Register Lineage Sinks (DI)
 
@@ -46,27 +52,26 @@ builder.EnableItemLevelLineage(opts => opts with { SampleEvery = 10 });
 // Pipeline-level lineage sink (most common)
 services.AddNPipelineLineage<MyPipelineSink>();
 
-// With custom collector
+// With a custom collector and sink
 services.AddNPipelineLineage<MyCollector, MyPipelineSink>();
 
-// Convenience: log lineage as JSON
+// Convenience: log pipeline lineage as JSON
 builder.UseLoggingPipelineLineageSink();
 ```
 
-### Phase 4: Inspect Lineage in Nodes
+### Phase 4: Inspect Lineage
 
-Nodes automatically receive `LineagePacket<T>` wrapped items when lineage is enabled. Access lineage metadata:
+Node implementations receive the plain item type (`T`), **not** `LineagePacket<T>`. The lineage adapter wraps items at the source and unwraps them before each node:
 
 ```csharp
-public override async Task<EnrichedOrder> TransformAsync(
-    LineagePacket<Order> item,  // Items are wrapped in LineagePacket
-    PipelineContext context, CancellationToken ct)
+public override async ValueTask<EnrichedOrder> TransformAsync(
+    Order order, PipelineContext context, CancellationToken ct)
 {
-    var correlationId = item.CorrelationId;
-    var lineageRecords = item.LineageRecords;  // Per-node visit records
-    var order = item.Data;      // The actual payload
-    // ...
+    // `order` is the payload; lineage is tracked around this call.
+    return await EnrichAsync(order, ct);
 }
 ```
 
-Consult `references/lineage-api.md` for the full LineageOptions, sink APIs, mapping strategies, and correlation details.
+Item payload snapshots and records are captured by the framework, not read off the item in node code. To consume lineage programmatically, implement an `ILineageSink` / `IPipelineLineageSink` (Phase 3) or query the `ILineageCollector`.
+
+Consult `references/lineage-api.md` for the full `LineageOptions`, sink APIs, mapping strategies, and correlation details.

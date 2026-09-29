@@ -1,8 +1,8 @@
 ---
 name: npipeline-pipeline-authoring
 description: Use when the user wants to create, define, or build an NPipeline data processing pipeline. Covers IPipelineDefinition, PipelineBuilder, connecting nodes, lambda nodes, running pipelines, PipelineContext, PipelineRunner, and dependency injection integration. Also use when the user mentions "create a pipeline", "define a pipeline", "build a pipeline", "add nodes", "IPipelineDefinition", "PipelineBuilder", "run a pipeline", or "AddNPipeline".
-npipelineVersion: "0.52.0"
-lastVerified: "2026-06-04"
+npipelineVersion: "0.67.0"
+lastVerified: "2026-09-29"
 ---
 
 # NPipeline Pipeline Authoring
@@ -101,7 +101,7 @@ Consult `references/configuration.md` for context configuration options.
 NPipeline follows six non-negotiable principles. Keep these in mind when authoring pipelines:
 
 1. **Streaming-first** — Data flows item-by-item via `IAsyncEnumerable<T>`. Nothing is buffered unless explicitly opted in.
-2. **Fail-fast defaults** — Default resilience policy returns `Fail` for all errors. Users must opt into retry, skip, or dead-letter.
+2. **Fail-fast defaults** — A failure that is not retried follows `OnItemFailure`, which defaults to `Fail`. The `Default` optimization profile retries transient item failures three times; users opt into skip or dead-letter.
 3. **Zero-allocation hot paths** — Per-item processing avoids heap allocations.
 4. **Type safety at the graph level** — Typed handles (`SourceNodeHandle<TOut>`, `TransformNodeHandle<TIn,TOut>`, `SinkNodeHandle<TIn>`) prevent connecting incompatible nodes at compile time.
 5. **Immutable configuration** — All config records are `sealed record` with `init`-only properties.

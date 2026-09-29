@@ -1,159 +1,149 @@
 # Validation and Cleansing Reference
 
-## StringValidationNode<T> — 12 Rules
+All rules and operations take a property selector as their first argument. There is no `ForProperty(...)` wrapper. Multiple properties are validated by chaining methods, each with its own selector.
+
+## StringValidationNode<T>
 
 | Rule | Method | Description |
 |---|---|---|
-| Not empty | `IsNotEmpty()` | Fails if null or "" |
-| Not whitespace | `IsNotWhitespace()` | Fails if null, "", or whitespace-only |
-| Min length | `HasMinLength(int)` | Min character count |
-| Max length | `HasMaxLength(int)` | Max character count |
-| Is email | `IsEmail()` | Validates email format |
-| Is URL | `IsUrl()` | Validates URL format |
-| Is GUID | `IsGuid()` | Validates GUID format |
-| Is alphanumeric | `IsAlphanumeric()` | Only letters and digits |
-| Matches regex | `Matches(string)` | Custom regex pattern |
-| ... and more | | |
+| Not empty | `IsNotEmpty(selector, errorMessage?)` | Fails if null or "" |
+| Not whitespace | `IsNotWhitespace(selector, errorMessage?)` | Fails if null, "", or whitespace-only |
+| Min length | `HasMinLength(selector, int, errorMessage?)` | Minimum character count |
+| Max length | `HasMaxLength(selector, int, errorMessage?)` | Maximum character count |
+| Length range | `HasLengthBetween(selector, int, int, errorMessage?)` | Between two lengths |
+| Email | `IsEmail(selector, errorMessage?)` | Email format |
+| URL | `IsUrl(selector, errorMessage?)` | URL format |
+| GUID | `IsGuid(selector, errorMessage?)` | GUID format |
+| Alphabetic | `IsAlphabetic(selector, errorMessage?)` | Only letters |
+| Alphanumeric | `IsAlphanumeric(selector, errorMessage?)` | Only letters and digits |
+| Digits only | `IsDigitsOnly(selector, errorMessage?)` | Only digits |
+| Numeric | `IsNumeric(selector, errorMessage?)` | Parses as a number |
+| Regex | `Matches(selector, string pattern, errorMessage?)` | Custom regex |
+| Prefix / suffix | `StartsWith(...)`, `EndsWith(...)` | Prefix or suffix |
+| Contains | `Contains(selector, string, errorMessage?)` | Substring present |
+| In list | `IsInList(selector, IEnumerable<string>, errorMessage?)` | Member of a set |
 
 ### Example
 
 ```csharp
 builder.AddStringValidation<Order>(cfg => cfg
-    .ForProperty(o => o.Email)
-    .IsNotEmpty()
-    .IsEmail()
-    .HasMaxLength(255));
+    .IsNotEmpty(o => o.Email)
+    .IsEmail(o => o.Email)
+    .HasMaxLength(o => o.Email, 255));
 ```
 
-Multiple properties can be validated simultaneously by chaining `.ForProperty()` calls.
+## NumericValidationNode<T>
 
-## NumericValidationNode<T> — 20+ Rules
-
-Supports `int`, `double`, `decimal`, and their nullable variants.
+Supports `int`, `double`, `decimal`, and their nullable variants (methods are generic over the numeric type).
 
 | Rule | Method |
 |---|---|
-| Not zero | `IsNotZero()` |
-| Positive | `IsPositive()` |
-| Negative | `IsNegative()` |
-| Greater than | `IsGreaterThan(T)` |
-| Less than | `IsLessThan(T)` |
-| In range | `IsInRange(T, T)` |
-| Is integer | `IsInteger()` (for floating types) |
-| ... and more | |
+| Positive | `IsPositive(selector, ...)` |
+| Negative | `IsNegative(selector, ...)` |
+| Non-zero | `IsNonZero(selector, ...)` |
+| Zero or positive | `IsZeroOrPositive(selector, ...)` |
+| Not negative | `IsNotNegative(selector, ...)` |
+| Greater than | `IsGreaterThan(selector, T, ...)` |
+| Less than | `IsLessThan(selector, T, ...)` |
+| Between | `IsBetween(selector, T min, T max, ...)` |
+| Integer value | `IsIntegerValue(selector, ...)` |
+| Even / odd | `IsEven(selector, ...)`, `IsOdd(selector, ...)` |
+| Finite | `IsFinite(selector, ...)` |
+| Not null | `IsNotNull(selector, ...)` |
 
 ### Example
 
 ```csharp
 builder.AddNumericValidation<Order>(cfg => cfg
-    .ForProperty(o => o.Amount)
-    .IsPositive()
-    .IsLessThan(100000)
-    .ForProperty(o => o.Quantity)
-    .IsGreaterThan(0)
-    .IsInteger());
+    .IsPositive(o => o.Amount)
+    .IsLessThan(o => o.Amount, 100_000)
+    .IsGreaterThan(o => o.Quantity, 0)
+    .IsIntegerValue(o => o.Quantity));
 ```
 
-## DateTimeValidationNode<T> — 15+ Rules
+## DateTimeValidationNode<T>
 
 | Rule | Method |
 |---|---|
-| In future | `IsInFuture()` |
-| In past | `IsInPast()` |
-| Not in future | `IsNotInFuture()` |
-| Is UTC | `IsUtc()` |
-| Is weekday | `IsWeekday()` |
-| Is weekend | `IsWeekend()` |
-| Is day of week | `IsDayOfWeek(DayOfWeek)` |
-| In range | `IsInRange(DateTime, DateTime)` |
-| ... and more | |
+| In future | `IsInFuture(selector, ...)` |
+| In past | `IsInPast(selector, ...)` |
+| After / before | `IsAfter(...)`, `IsBefore(...)` |
+| Between | `IsBetween(selector, DateTime min, DateTime max, ...)` |
+| UTC | `IsUtc(selector, ...)` |
+| Local | `IsLocal(selector, ...)` |
+| Weekday / weekend | `IsWeekday(selector, ...)`, `IsWeekend(selector, ...)` |
+| Day of week | `IsDayOfWeek(selector, DayOfWeek, ...)` |
+| Today | `IsToday(selector, ...)` |
+| In year / month | `IsInYear(...)`, `IsInMonth(...)` |
+| Not null | `IsNotNull(selector, ...)` |
+| Not min/max | `IsNotMinValue(...)`, `IsNotMaxValue(...)` |
 
-### Example
-
-```csharp
-builder.AddDateTimeValidation<Order>(cfg => cfg
-    .ForProperty(o => o.DeliveryDate)
-    .IsInFuture()
-    .IsWeekday()
-    .ForProperty(o => o.CreatedAt)
-    .IsNotInFuture());
-```
-
-## CollectionValidationNode<T> — 10 Rules
+## CollectionValidationNode<T>
 
 | Rule | Method |
 |---|---|
-| Not empty | `IsNotEmpty()` |
-| Min count | `HasMinCount(int)` |
-| Max count | `HasMaxCount(int)` |
-| All match | `AllMatch(Func<T, bool>)` |
-| All unique | `AllUnique()` |
-| Contains | `Contains(T)` |
-| ... and more | |
+| Not empty | `IsNotEmpty(selector, ...)` |
+| Min / max count | `HasMinCount(selector, int, ...)`, `HasMaxCount(selector, int, ...)` |
+| Count range | `HasCountBetween(selector, int min, int max, ...)` |
+| All match | `AllMatch(selector, Func<TItem,bool>, ...)` |
+| Any match | `AnyMatch(selector, Func<TItem,bool>, ...)` |
+| None match | `NoneMatch(selector, Func<TItem,bool>, ...)` |
+| All unique | `AllUnique(selector, ...)` |
+| Contains | `Contains(selector, TItem, ...)` / `DoesNotContain(...)` |
+| Subset | `IsSubsetOf(selector, IEnumerable<TItem>, ...)` |
 
-## StringCleansingNode<T> — 14 Operations
+## StringCleansingNode<T>
 
-| Operation | Method | Description |
-|---|---|---|
-| Trim | `Trim()` | Removes leading/trailing whitespace |
-| Collapse whitespace | `CollapseWhitespace()` | Multiple spaces → single space |
-| To title case | `ToTitleCase()` | "john smith" → "John Smith" |
-| To upper | `ToUpper()` | Uppercase conversion |
-| To lower | `ToLower()` | Lowercase conversion |
-| Truncate | `Truncate(int)` | Cut to max length |
-| Replace | `Replace(string, string)` | Substring replacement |
-| Default if null | `DefaultIfNullOrWhitespace(string)` | Fallback value |
-| ... and more | | |
+| Operation | Method |
+|---|---|
+| Trim | `Trim(selector)` |
+| Trim start / end | `TrimStart(selector)`, `TrimEnd(selector)` |
+| Collapse whitespace | `CollapseWhitespace(selector)` |
+| Remove whitespace | `RemoveWhitespace(selector)` |
+| To upper / lower / title | `ToUpper(selector)`, `ToLower(selector)`, `ToTitleCase(selector)` |
+| Remove special chars | `RemoveSpecialCharacters(selector)` |
+| Remove digits | `RemoveDigits(selector)` |
+| Remove non-ASCII | `RemoveNonAscii(selector)` |
+| Truncate | `Truncate(selector, int maxLength)` |
+| Ensure prefix / suffix | `EnsurePrefix(selector, string)`, `EnsureSuffix(selector, string)` |
+| Replace | `Replace(selector, string old, string new)` |
+| Default if null/whitespace | `DefaultIfNullOrWhitespace(selector, string)` |
+| Default if null/empty | `DefaultIfNullOrEmpty(selector, string)` |
+| Null if whitespace | `NullIfWhitespace(selector)` |
 
 ## NumericCleansingNode<T>
 
 | Operation | Method |
 |---|---|
-| Clamp | `Clamp(T, T)` — constrain to range |
-| Min | `Min(T)` — floor value |
-| Max | `Max(T)` — ceiling value |
-| Round | `Round(int)` — decimal places |
-| Floor | `Floor()` |
-| Ceiling | `Ceiling()` |
-| Absolute value | `AbsoluteValue()` |
-| Scale | `Scale(double)` — multiply by factor |
+| Clamp | `Clamp(selector, T min, T max)` |
+| Min / max | `Min(selector, T)`, `Max(selector, T)` |
+| Round | `Round(selector, int decimals)` |
+| Floor / ceiling | `Floor(selector)`, `Ceiling(selector)` |
+| Absolute value | `AbsoluteValue(selector)` |
+| Scale | `Scale(selector, double factor)` |
+| Default if null | `DefaultIfNull(selector, T)` |
+| To zero if negative | `ToZeroIfNegative(selector)` |
 
 ## DateTimeCleansingNode<T>
 
 | Operation | Method |
 |---|---|
-| Specify kind | `SpecifyKind(DateTimeKind)` |
-| To UTC | `ToUtc()` |
-| To local | `ToLocal()` |
-| Strip time | `StripTime()` — keep date only |
-| Truncate to minute | `Truncate(TimeSpan)` |
-| Round to nearest minute | `RoundToMinute()` |
-| Clamp | `Clamp(DateTime, DateTime)` |
+| Specify kind | `SpecifyKind(selector, DateTimeKind)` |
+| To UTC / local | `ToUtc(selector)`, `ToLocal(selector)` |
+| Strip time | `StripTime(selector)` |
+| Truncate | `Truncate(selector, TimeSpan)` |
+| Round to minute/hour/day | `RoundToMinute(selector)`, `RoundToHour(selector)`, `RoundToDay(selector)` |
+| Clamp | `Clamp(selector, DateTime min, DateTime max)` |
+| Default if null/min/max | `DefaultIfNull(...)`, `DefaultIfMinValue(...)`, `DefaultIfMaxValue(...)` |
 
 ## CollectionCleansingNode<T>
 
 | Operation | Method |
 |---|---|
-| Remove nulls | `RemoveNulls()` |
-| Remove duplicates | `RemoveDuplicates()` |
-| Remove empty | `RemoveEmpty()` |
-| Sort | `Sort()` |
-| Reverse | `Reverse()` |
-| Take | `Take(int)` |
-| Skip | `Skip(int)` |
-
-## Error Handling
-
-All validation/cleansing/filtering nodes support per-rule error decisions:
-
-```csharp
-cfg.ForProperty(o => o.Email)
-    .IsEmail()
-    .OnError(ResilienceDecision.Skip); // Skip invalid items
-
-cfg.ForProperty(o => o.Amount)
-    .IsPositive()
-    .OnError(ResilienceDecision.DeadLetter); // Dead-letter invalid items
-```
-
-Default decision: `Fail` (throw exception, stop pipeline unless resilience policy overrides).
+| Remove nulls | `RemoveNulls(selector)` |
+| Remove duplicates | `RemoveDuplicates(selector, comparer?)` |
+| Remove empty | `RemoveEmpty(selector)` |
+| Remove whitespace | `RemoveWhitespace(selector)` |
+| Sort | `Sort(selector, comparer?)` |
+| Reverse | `Reverse(selector)` |
+| Take / skip | `Take(selector, int)`, `Skip(selector, int)` |

@@ -12,7 +12,7 @@ dotnet add package NPipeline.Extensions.DependencyInjection
 
 ### Assembly Scanning (Recommended)
 
-Discovers and registers all `INode`, `IPipelineDefinition`, `IResiliencePolicy`, `IDeadLetterSink`, `ILineageSink`, and related implementations:
+Discovers and registers all `INode`, `IPipelineDefinition`, `IResiliencePolicy`, `IDeadLetterSink`, `ILineageSink`, `IPipelineLineageSink`, and `IPipelineLineageSinkProvider` implementations:
 
 ```csharp
 services.AddNPipeline(typeof(MyPipeline).Assembly);
@@ -40,7 +40,9 @@ services.AddNPipeline(builder => builder
 | `AddLineageSink<T>()` | Register an item-level lineage sink |
 | `AddPipelineLineageSink<T>()` | Register a pipeline-level lineage sink |
 | `AddLineageSinkProvider<T>()` | Register a lineage sink provider |
-| `ScanAssemblies(Assembly[])` | Assembly scan for the above types |
+| `ScanAssemblies(params Assembly[])` | Assembly scan for the above types |
+
+Most `AddX<T>` methods have an overload taking a `ServiceLifetime`; all default to `Transient`.
 
 ### Service Lifetimes
 
@@ -52,7 +54,8 @@ services.AddNPipeline(builder => builder
 | `IPipelineRunner` / `PipelineRunner` | Scoped |
 | `INodeExecutor` | Scoped |
 | `ITopologyService` | Scoped |
-| `IErrorHandlingService` | Scoped |
+| `IErrorHandlingService` | Transient |
+| `IObservabilitySurface` | Singleton (null surface unless observability is registered) |
 
 ## Running Pipelines from DI
 
@@ -60,6 +63,23 @@ services.AddNPipeline(builder => builder
 var provider = services.BuildServiceProvider();
 await provider.RunPipelineAsync<MyPipeline>();
 ```
+
+`RunPipelineAsync` creates a scope, resolves the runner, creates a context wired to the container, and disposes both.
+
+## Creating a Context Yourself
+
+When you resolve the runner and run it directly, create the context through the container so it receives the container's services (logger factory, tracer, observability collector, and every registered `IExecutionObserver`):
+
+```csharp
+await using var scope = serviceProvider.CreateAsyncScope();
+var runner = scope.ServiceProvider.GetRequiredService<IPipelineRunner>();
+await using var context = scope.ServiceProvider.CreatePipelineContext(
+    PipelineContextConfiguration.WithCancellation(cancellationToken));
+await runner.RunAsync<MyPipeline>(context);
+```
+
+> [!WARNING]
+> A context created with `new PipelineContext()` or `PipelineContext.CreateDefault()` is not wired to the container. Lineage reports, metrics, and NPipeline's own logging are silently lost. Use the context the provider of the run's scope creates.
 
 ## Constructor Injection in Nodes
 
@@ -77,7 +97,7 @@ public class MyTransform : TransformNode<Order, EnrichedOrder>
         _logger = logger;
     }
 
-    public override async Task<EnrichedOrder> TransformAsync(
+    public override async ValueTask<EnrichedOrder> TransformAsync(
         Order item, PipelineContext context, CancellationToken ct)
     {
         var enriched = await _service.EnrichAsync(item, ct);
@@ -88,3 +108,7 @@ public class MyTransform : TransformNode<Order, EnrichedOrder>
 ```
 
 The `DiContainerNodeFactory` uses compiled expression trees for fast constructor invocation, with `ActivatorUtilities` as a fallback.
+
+## Ownership and Disposal
+
+The run disposes only the instances it owns. Instances resolved from the container are left to the container; instances created from a configured type are disposed at the end of each run, not with the context.

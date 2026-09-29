@@ -1,54 +1,58 @@
 # Node Development Patterns
 
-## ValueTask Fast Path
+## ValueTask-Native Transforms
 
-The per-item execution loop can avoid `Task` allocations when transforms are synchronous. Override `ExecuteValueTaskAsync` instead of `TransformAsync`:
+`TransformAsync` returns `ValueTask<TOut>`. A transform that completes synchronously allocates nothing per item. There is no separate interface to implement or method to override:
 
 ```csharp
-// DO THIS (allocation-free for synchronous work):
-protected override ValueTask<EnrichedOrder> ExecuteValueTaskAsync(
+// Allocation-free for synchronous work:
+public override ValueTask<EnrichedOrder> TransformAsync(
     Order item, PipelineContext context, CancellationToken ct)
 {
     var result = Enrich(item); // synchronous work
-    return new ValueTask<EnrichedOrder>(result);
+    return ValueTask.FromResult(result);
 }
 
-// NOT THIS (creates Task allocation per item):
-public override Task<EnrichedOrder> TransformAsync(Order item, ...)
+// Still valid, but allocates a state machine per item when it does not complete synchronously:
+public override async ValueTask<EnrichedOrder> TransformAsync(
+    Order item, PipelineContext context, CancellationToken ct)
 {
-    var result = Enrich(item);
-    return Task.FromResult(result); // heap allocation per item
+    var result = await EnrichAsync(item, ct);
+    return result;
 }
 ```
 
-When `ExecuteValueTaskAsync` is overridden, execution strategies that support `IValueTaskTransform` use it directly, bypassing `TransformAsync` entirely.
+> [!TIP]
+> Prefer the synchronous `ValueTask.FromResult` form for CPU-only work. An `async` method with no real `await` allocates a state machine even when it returns a completed task.
 
 ## Resource Disposal
 
-All nodes implement `IAsyncDisposable`. Override when holding resources:
+Nodes are disposable only if they implement `IAsyncDisposable` or `IDisposable` themselves. The runtime checks for the interface and disposes the instance at the end of the run that created it. Instances resolved from a DI container are left to the container, so they are not disposed twice. There is no base implementation to call:
 
 ```csharp
-public class DbSink : SinkNode<EnrichedOrder>
+public class DbSink : SinkNode<EnrichedOrder>, IAsyncDisposable
 {
     private readonly SqlConnection _conn;
 
     public DbSink(SqlConnection conn) => _conn = conn;
 
-    public override async ValueTask DisposeAsync()
+    public override async Task ConsumeAsync(
+        IDataStream<EnrichedOrder> input, PipelineContext context, CancellationToken ct)
     {
-        await _conn.DisposeAsync();      // Dispose your resources
-        await base.DisposeAsync();       // Always call base (calls GC.SuppressFinalize)
+        // ...
     }
+
+    public async ValueTask DisposeAsync() => await _conn.DisposeAsync();
 }
 ```
 
-For synchronous `IDisposable` resources (e.g., `FileStream`), use `DisposeAsync()` and convert:
+For a synchronous `IDisposable` resource, dispose it from `DisposeAsync`:
 
 ```csharp
-public override async ValueTask DisposeAsync()
+public ValueTask DisposeAsync()
 {
-        _fileStream?.Dispose();
-    await base.DisposeAsync();
+    _fileStream?.Dispose();
+    return ValueTask.CompletedTask;
 }
 ```
 
@@ -69,17 +73,25 @@ public class MyTransform : TransformNode<Order, EnrichedOrder>
         _log = log;
         _opts = opts;
     }
+
+    public override async ValueTask<EnrichedOrder> TransformAsync(
+        Order item, PipelineContext context, CancellationToken ct)
+    {
+        var enriched = await _svc.EnrichAsync(item, ct);
+        _log.LogInformation("Enriched order {Id}", item.Id);
+        return enriched;
+    }
 }
 ```
 
-The factory uses compiled expression trees for constructor invocation, with `ActivatorUtilities` as a fallback. Greedy parameter resolution is used — the factory resolves each parameter from the `IServiceProvider` in order.
+The factory uses compiled expression trees for constructor invocation, with `ActivatorUtilities` as a fallback. Greedy parameter resolution is used: the factory resolves each parameter from the `IServiceProvider` in order.
 
 ## Forwarding CancellationToken
 
 Always pass `CancellationToken` to async operations:
 
 ```csharp
-public override async Task<EnrichedOrder> TransformAsync(
+public override async ValueTask<EnrichedOrder> TransformAsync(
     Order item, PipelineContext context, CancellationToken ct)
 {
     var result = await _api.GetAsync(item.Id, ct);  // Pass ct
@@ -90,20 +102,15 @@ public override async Task<EnrichedOrder> TransformAsync(
 For `IAsyncEnumerable` enumeration, use `.WithCancellation(ct)`:
 
 ```csharp
-public override IDataStream<Order> OpenStream(
-    PipelineContext context, CancellationToken ct)
+await foreach (var item in input.WithCancellation(ct))
 {
-    return DataStream.FromAsyncEnumerable(async cancellationToken =>
-    {
-        await foreach (var item in _reader.ReadAsync().WithCancellation(cancellationToken))
-            yield return item;
-    });
+    // ...
 }
 ```
 
 ## INodeTypeMetadata
 
-`TransformNode<TIn, TOut>` and `IStreamTransformNode<TIn, TOut>` implement `INodeTypeMetadata`, which provides `InputType` and `OutputType` as `Type` properties without reflection. The base class handles this automatically.
+`TransformNode<TIn, TOut>`, `SourceNode<TOut>`, `SinkNode<TIn>`, and `LookupNode<...>` implement `INodeTypeMetadata`, which provides `InputType` and `OutputType` as `Type` properties without reflection. The base class handles this automatically. `IStreamTransformNode<TIn, TOut>` does **not** implement `INodeTypeMetadata`; the framework derives its input and output types from the interface's generic arguments.
 
 ## Metadata Attributes
 
@@ -111,21 +118,33 @@ The `NPipeline.Attributes` namespace provides node metadata attributes:
 
 | Attribute | Purpose |
 |---|---|
-| `[KeySelector(Type)]` | Marks the key selector property for join/aggregate nodes |
+| `[KeySelector(Type, params string[])]` | Marks the key property (or properties) for a given input type on join nodes. Apply once per input type. |
 | `[MergeStrategy(Type)]` | Specifies merge strategy for fan-in nodes |
-| `[Cardinality(int)]` | Declares expected cardinality |
+| `[TransformCardinality(TransformCardinality)]` | Declares a transform's input-to-output cardinality (for example `OneToOne`, `OneToMany`) |
 | `[NodeOwner(string)]` | Tags node ownership |
 | `[NodeDescription(string)]` | Human-readable node description |
-| `[PipelineName(string)]` | Pipeline-level name override |
+| `[NodeRemark(string)]` | Additional documentation remark |
+| `[PipelineName(string)]` / `[PipelineDescription(string)]` | Pipeline-level metadata |
+| `[LineageMapper(Type)]` | Declares the lineage mapper used when the node reshapes items |
 
 ## Execution Strategy
 
-Every transform and source node has an `ExecutionStrategy` property. Default: `SequentialExecutionStrategy`. Set directly or via the builder:
+There is no `ExecutionStrategy` property on a node. Set the strategy on the graph through the handle:
 
 ```csharp
-// In node constructor
-public MyNode() => ExecutionStrategy = new BatchingExecutionStrategy(100);
-
-// Via builder
+// Via the fluent handle extension
 handle.WithExecutionStrategy(builder, new BatchingExecutionStrategy(100));
 ```
+
+A node type with an inherent default strategy implements `IExecutionStrategyProvider`:
+
+```csharp
+public class MyBatchingNode : IStreamTransformNode<Order, IReadOnlyCollection<Order>>, IExecutionStrategyProvider
+{
+    public IExecutionStrategy DefaultExecutionStrategy => new BatchingExecutionStrategy(100);
+
+    // ...
+}
+```
+
+A strategy configured on the graph with `WithExecutionStrategy` takes precedence over the node's supplied default.

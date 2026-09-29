@@ -9,65 +9,41 @@ using NPipeline.Nodes;
 using NPipeline.Pipeline;
 
 public abstract class TransformNode<TIn, TOut>
-    : ITransformNode<TIn, TOut>, INodeTypeMetadata, IValueTaskTransform<TIn, TOut>
+    : ITransformNode<TIn, TOut>, INodeTypeMetadata
 {
     public Type InputType => typeof(TIn);        // No-reflection metadata
     public Type OutputType => typeof(TOut);
 
-    // Default: SequentialExecutionStrategy — override or set via builder
-    public IExecutionStrategy ExecutionStrategy { get; set; }
-
-    // Required: your transformation logic
-    public abstract Task<TOut> TransformAsync(
+    // Returns ValueTask, so a synchronous transform allocates nothing per item.
+    public abstract ValueTask<TOut> TransformAsync(
         TIn item, PipelineContext context, CancellationToken cancellationToken);
-
-    // Optional: override for allocation-free synchronous transforms
-    // Default wraps TransformAsync, so Task-based implementations already work.
-    // Override to return a naturally produced ValueTask<TOut> to avoid allocations.
-    ValueTask<TOut> IValueTaskTransform<TIn, TOut>.ExecuteValueTaskAsync(
-        TIn item, PipelineContext context, CancellationToken cancellationToken)
-    {
-        return ExecuteValueTaskAsync(item, context, cancellationToken);
-    }
-
-    // Override in derived classes
-    protected virtual ValueTask<TOut> ExecuteValueTaskAsync(
-        TIn item, PipelineContext context, CancellationToken cancellationToken)
-    {
-        // Default: wrap the Task result
-        return new ValueTask<TOut>(TransformAsync(item, context, cancellationToken));
-    }
-
-    // Disposal
-    public virtual ValueTask DisposeAsync()
-    {
-        GC.SuppressFinalize(this);
-        return ValueTask.CompletedTask;
-    }
 }
 ```
 
-### Example: Synchronous Transform (ValueTask fast path)
+How the node runs is a property of the graph, not the node: the execution strategy lives on the graph node definition and is set with `WithExecutionStrategy`. `TransformNode<TIn, TOut>` has no `ExecutionStrategy` property.
+
+### Example: Synchronous Transform
+
+Return `ValueTask.FromResult(...)` directly. There is no separate fast path to override.
 
 ```csharp
 public class ValidateOrder : TransformNode<Order, Order>
 {
-    protected override ValueTask<Order> ExecuteValueTaskAsync(
+    public override ValueTask<Order> TransformAsync(
         Order item, PipelineContext context, CancellationToken ct)
     {
         if (string.IsNullOrEmpty(item.CustomerName))
             throw new ValidationException("Customer name is required");
-        item.ValidatedAt = DateTime.UtcNow;
-        return new ValueTask<Order>(item);
-    }
 
-    // TransformAsync is NOT called when ExecuteValueTaskAsync is overridden
-    public override Task<Order> TransformAsync(Order item, PipelineContext ctx, CancellationToken ct)
-        => throw new NotImplementedException();
+        item.ValidatedAt = DateTime.UtcNow;
+        return ValueTask.FromResult(item);
+    }
 }
 ```
 
 ### Example: Asynchronous Transform
+
+An `async` method returning `ValueTask<TOut>` needs no other change.
 
 ```csharp
 public class EnrichOrder : TransformNode<Order, EnrichedOrder>
@@ -76,7 +52,7 @@ public class EnrichOrder : TransformNode<Order, EnrichedOrder>
 
     public EnrichOrder(ICustomerApi api) => _api = api;
 
-    public override async Task<EnrichedOrder> TransformAsync(
+    public override async ValueTask<EnrichedOrder> TransformAsync(
         Order item, PipelineContext context, CancellationToken ct)
     {
         var customer = await _api.GetCustomerAsync(item.CustomerId, ct);
@@ -88,17 +64,26 @@ public class EnrichOrder : TransformNode<Order, EnrichedOrder>
 ## SourceNode<TOut>
 
 ```csharp
-public abstract class SourceNode<TOut> : ISourceNode<TOut>
+public abstract class SourceNode<TOut> : ISourceNode<TOut>, INodeTypeMetadata
 {
-    public IExecutionStrategy ExecutionStrategy { get; set; }
+    public Type? InputType => null;
+    public Type OutputType => typeof(TOut);
+
     public abstract IDataStream<TOut> OpenStream(
         PipelineContext context, CancellationToken cancellationToken);
+
+    // Attributes dead-lettered rows to this node; call from OpenStream.
+    protected DeadLetterChannel OpenDeadLetterChannel(PipelineContext context);
 }
 ```
 
 ### Example
 
+Return a `DataStream<T>` wrapping an `IAsyncEnumerable<T>` for lazy streaming. Use `InMemoryDataStream<T>` only for small, bounded collections.
+
 ```csharp
+using NPipeline.DataFlow.DataStreams;
+
 public class ApiSource : SourceNode<Order>
 {
     private readonly IOrderRepository _repo;
@@ -108,17 +93,26 @@ public class ApiSource : SourceNode<Order>
     public override IDataStream<Order> OpenStream(
         PipelineContext context, CancellationToken ct)
     {
-        return DataStream.FromAsyncEnumerable(async cancellationToken =>
+        return new DataStream<Order>(ReadAsync(ct), "orders");
+    }
+
+    private async IAsyncEnumerable<Order> ReadAsync(
+        [EnumeratorCancellation] CancellationToken cancellationToken)
+    {
+        var cursor = 0;
+
+        while (true)
         {
-            var cursor = 0;
-            while (true)
-            {
-                var batch = await _repo.GetBatchAsync(cursor, pageSize: 100, cancellationToken);
-                if (batch.Length == 0) yield break;
-                foreach (var order in batch) yield return order;
-                cursor += batch.Length;
-            }
-        });
+            var batch = await _repo.GetBatchAsync(cursor, pageSize: 100, cancellationToken);
+
+            if (batch.Length == 0)
+                yield break;
+
+            foreach (var order in batch)
+                yield return order;
+
+            cursor += batch.Length;
+        }
     }
 }
 ```
@@ -126,10 +120,16 @@ public class ApiSource : SourceNode<Order>
 ## SinkNode<TIn>
 
 ```csharp
-public abstract class SinkNode<TIn> : ISinkNode<TIn>
+public abstract class SinkNode<TIn> : ISinkNode<TIn>, INodeTypeMetadata
 {
+    public Type InputType => typeof(TIn);
+    public Type? OutputType => null;
+
     public abstract Task ConsumeAsync(
         IDataStream<TIn> input, PipelineContext context, CancellationToken cancellationToken);
+
+    // Attributes dead-lettered writes to this node; call at the start of ConsumeAsync.
+    protected DeadLetterChannel OpenDeadLetterChannel(PipelineContext context);
 }
 ```
 
@@ -152,50 +152,69 @@ public class DatabaseSink : SinkNode<EnrichedOrder>, IAsyncDisposable
         }
     }
 
-    public override async ValueTask DisposeAsync()
-    {
-        await _connection.DisposeAsync();
-        await base.DisposeAsync();
-    }
+    // Nodes are disposable only if they implement it; there is no base to call.
+    public async ValueTask DisposeAsync() => await _connection.DisposeAsync();
 }
 ```
+
+> [!WARNING]
+> You must consume the `input` parameter in `ConsumeAsync`. The `SinkNodeInputConsumptionAnalyzer` (NP9301) reports an error if you don't.
 
 ## IStreamTransformNode<TIn, TOut>
 
 Use when you need to process the entire stream, not individual items.
 
 ```csharp
-public interface IStreamTransformNode<TIn, TOut> : IStreamTransformNode, INodeTypeMetadata
+public interface IStreamTransformNode<in TIn, TOut> : IStreamTransformNode
 {
-    IExecutionStrategy ExecutionStrategy { get; set; }
     IAsyncEnumerable<TOut> TransformAsync(
-        IAsyncEnumerable<TIn> input,
+        IAsyncEnumerable<TIn> items,
         PipelineContext context,
         CancellationToken cancellationToken);
 }
 ```
+
+The interface has no `ExecutionStrategy` property and does not implement `INodeTypeMetadata`. Register via `builder.AddStreamTransform<SortOrders, Order, Order>()`.
 
 ### Example: Sorting Node
 
 ```csharp
 public class SortOrders : IStreamTransformNode<Order, Order>
 {
-    public Type InputType => typeof(Order);
-    public Type OutputType => typeof(Order);
-    public IExecutionStrategy ExecutionStrategy { get; set; } = new SequentialExecutionStrategy();
-
     public async IAsyncEnumerable<Order> TransformAsync(
-        IAsyncEnumerable<Order> input,
+        IAsyncEnumerable<Order> items,
         PipelineContext context,
         [EnumeratorCancellation] CancellationToken ct)
     {
-        var items = await input.ToListAsync(ct);
-        foreach (var item in items.OrderBy(o => o.CreatedAt))
+        var buffer = new List<Order>();
+
+        await foreach (var item in items.WithCancellation(ct))
+            buffer.Add(item);
+
+        buffer.Sort(static (a, b) => a.CreatedAt.CompareTo(b.CreatedAt));
+
+        foreach (var item in buffer)
             yield return item;
     }
-
-    public ValueTask DisposeAsync() => ValueTask.CompletedTask;
 }
 ```
 
-Register via `builder.AddStreamTransform<SortOrders, Order, Order>()`.
+## LookupNode<TIn, TKey, TValue, TOut>
+
+`LookupAsync` returns `ValueTask<TValue?>`, so a cache hit costs no allocation.
+
+```csharp
+public class CustomerLookup : LookupNode<Order, int, Customer, EnrichedOrder>
+{
+    protected override int ExtractKey(Order input, PipelineContext context)
+        => input.CustomerId;
+
+    protected override async ValueTask<Customer?> LookupAsync(
+        int key, PipelineContext context, CancellationToken ct)
+        => await _db.FindCustomerAsync(key, ct);
+
+    protected override EnrichedOrder CreateOutput(
+        Order input, Customer? customer, PipelineContext context)
+        => new(input, customer);
+}
+```

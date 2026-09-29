@@ -7,7 +7,7 @@ The central implementation (`IObservabilitySurface`) orchestrates pipeline and n
 ```csharp
 public interface IObservabilitySurface
 {
-    IPipelineActivity BeginPipeline<TDefinition>(PipelineContext context);
+    IPipelineActivity BeginPipeline<TDefinition>(PipelineContext context) where TDefinition : IPipelineDefinition, new();
     Task CompletePipeline<TDefinition>(PipelineContext context, PipelineGraph graph, IPipelineActivity activity);
     Task FailPipeline<TDefinition>(PipelineContext context, Exception ex, IPipelineActivity activity);
 
@@ -17,17 +17,34 @@ public interface IObservabilitySurface
 }
 ```
 
-## ObservabilityCollector
+## IObservabilityCollector
 
-Thread-safe collector using `ConcurrentDictionary`. Aggregates per-node metrics through a `NodeMetricsBuilder`:
+The collector is keyed by both node id and pipeline id (a run can nest sub-pipelines):
 
 ```csharp
 public interface IObservabilityCollector
 {
-    void RecordNodeStart(string nodeId, NodeMetrics metrics);
-    void RecordNodeComplete(string nodeId, NodeExecutionCompleted completed);
-    PipelineMetrics GetPipelineMetrics();
-    void EmitToSink(IMetricsSink sink);
+    void RecordNodeStart(string nodeId, DateTimeOffset timestamp, Guid pipelineId, int? threadId = null,
+        double? initialMemoryMb = null, string? pipelineName = null);
+    void RecordNodeEnd(string nodeId, DateTimeOffset timestamp, bool success, Guid pipelineId,
+        Exception? exception = null, double? peakMemoryMb = null, double? processorTimeMs = null, string? pipelineName = null);
+    void RecordItemMetrics(string nodeId, long itemsProcessed, long itemsEmitted, Guid pipelineId, string? pipelineName = null);
+    void RecordNodeKind(string nodeId, NodeKind kind, Guid pipelineId, string? pipelineName = null);       // default impl
+    void RecordItemsReplayed(string nodeId, long itemsReplayed, Guid pipelineId, string? pipelineName = null); // default impl
+    void RecordRetry(string nodeId, int retryCount, Guid pipelineId, string? reason = null, string? pipelineName = null);
+    void RecordRetryExhausted(string nodeId, Guid pipelineId, string? pipelineName = null);                 // default impl
+    void RecordCircuitStateChanged(string nodeId, CircuitState state, Guid pipelineId, string? pipelineName = null);
+    void RecordPerformanceMetrics(string nodeId, double throughputItemsPerSec, double averageItemProcessingMs,
+        Guid pipelineId, string? pipelineName = null);
+    void RecordTimingBreakdown(string nodeId, NodeTimingBreakdown timingBreakdown, Guid pipelineId, string? pipelineName = null);
+
+    IReadOnlyList<INodeMetrics> GetNodeMetrics();
+    INodeMetrics? GetNodeMetrics(string nodeId, Guid pipelineId);
+    void ReleasePipeline(Guid pipelineId);   // default impl; releases a run's metrics
+    IPipelineMetrics CreatePipelineMetrics(string pipelineName, Guid pipelineId, Guid runId, DateTimeOffset startTime,
+        DateTimeOffset? endTime, bool success, Exception? exception = null);
+    Task EmitMetricsAsync(string pipelineName, Guid pipelineId, Guid runId, DateTimeOffset startTime,
+        DateTimeOffset? endTime, bool success, Exception? exception = null, CancellationToken cancellationToken = default);
 }
 ```
 
@@ -42,7 +59,7 @@ Per-node timing captures four distinct buckets:
 | `OutputBlockDuration` | Time the node was blocked by downstream backpressure |
 | `WallDuration` | Total wall-clock time (work + wait + block) |
 
-Throughput is calculated as `processed items / wall duration`.
+Throughput is `processed items / wall duration`.
 
 ## Metrics Sinks
 
@@ -62,7 +79,7 @@ Node 'validate' completed: 1000 items in 2.3s (434 items/s)
 
 ### LoggingPipelineMetricsSink
 
-Logs overall pipeline metrics:
+Logs pipeline items in and out, duration, and throughput:
 
 ```csharp
 services.AddNPipelineObservability<LoggingMetricsSink, LoggingPipelineMetricsSink>();
@@ -74,34 +91,44 @@ Pipeline 'OrderPipeline' completed: 10000 items in 12.5s (800 items/s)
   5 nodes, 0 errors
 ```
 
+A node without observability options reports `ItemCountsRecorded = false`, and the sinks say its item counts were not recorded instead of logging "Processed 0 items".
+
 ## DI Registration
 
 ### AddNPipelineObservability
 
-10 overloads with varying levels of customization. All return `IServiceCollection`:
+Overloads with varying levels of customization. All return `IServiceCollection`:
 
 ```csharp
-// Simplest — default sinks
+// Simplest: default options
 services.AddNPipelineObservability();
+
+// With options
+services.AddNPipelineObservability(new ObservabilityExtensionOptions { AutoObserveAllNodes = true });
 
 // With typed sinks
 services.AddNPipelineObservability<MyMetricsSink, MyPipelineSink>();
 
-// With custom sinks and options
-services.AddNPipelineObservability<MyMetricsSink, MyPipelineSink>(
-    new ObservabilityExtensionOptions { EnableMemoryMetrics = true });
+// With typed sinks and options
+services.AddNPipelineObservability<MyMetricsSink, MyPipelineSink>(options);
 
 // With factory delegates
 services.AddNPipelineObservability(
     sp => new MyMetricsSink(sp.GetRequiredService<ILogger<MyMetricsSink>>()),
     sp => new MyPipelineSink(sp.GetRequiredService<ILogger<MyPipelineSink>>()));
 
-// With custom collector
+// With a custom collector
 services.AddNPipelineObservability<MyCollector, MyMetricsSink, MyPipelineSink>();
+```
 
-// With factory delegate for collector
-services.AddNPipelineObservability<MyMetricsSink, MyPipelineSink>(
-    sp => new MyCollector(sp));
+`AddNPipelineObservability` is safe to call more than once: the first call that passes options sets them, and it adds its metrics observer alongside (not instead of) an observer the app registered.
+
+### ConfigureNPipelineObservability
+
+Adjusts the options whether it is called before or after `AddNPipelineObservability`:
+
+```csharp
+services.ConfigureNPipelineObservability(o => o with { AutoObserveAllNodes = true });
 ```
 
 ## Enabling Observability on Nodes
@@ -113,29 +140,35 @@ transform.WithObservability(builder);
 sink.WithObservability(builder);
 join.WithObservability(builder);
 aggregate.WithObservability(builder);
+
+// With explicit options
+transform.WithObservability(builder, ObservabilityOptions.Full);
 ```
 
-Extension methods available on `SourceNodeHandle`, `TransformNodeHandle`, `SinkNodeHandle`, `JoinNodeHandle`, and `AggregateNodeHandle`.
+Extension methods are available on `SourceNodeHandle`, `TransformNodeHandle`, `SinkNodeHandle`, `AggregateNodeHandle`, and `JoinNodeHandle`.
 
 ## PipelineMetrics
 
 ```csharp
-public sealed record PipelineMetrics
-{
-    Guid PipelineId
-    string PipelineName
-    DateTimeOffset StartTime
-    DateTimeOffset EndTime
-    TimeSpan Duration
-    int TotalNodes
-    int SuccessfulNodes
-    int FailedNodes
-    long TotalItemsProcessed
-    double OverallThroughput  // items/second
-    IReadOnlyDictionary<string, NodeMetrics> NodeMetrics
-}
+public sealed record PipelineMetrics(
+    string PipelineName,
+    Guid PipelineId,
+    Guid RunId,
+    DateTimeOffset StartTime,
+    DateTimeOffset? EndTime,
+    double? DurationMs,
+    bool Success,
+    long TotalItemsProcessed,
+    IReadOnlyList<INodeMetrics> NodeMetrics,
+    Exception? Exception,
+    long? ItemsIn = null,      // items the pipeline's source nodes emitted
+    long? ItemsOut = null) : IPipelineMetrics;   // items the pipeline's sink nodes processed
 ```
+
+`ItemsIn` and `ItemsOut` are `null` when no node recorded item counts. `TotalItemsProcessed` is the sum across nodes and includes sources, sinks, joins, and aggregates.
+
+`INodeMetrics.Kind` reports the node's kind. `NodeMetrics` also carries `ItemsReplayed` and `ItemCountsRecorded`.
 
 ## ExecutionObserver
 
-`MetricsCollectingExecutionObserver` captures start/completion/retry events with memory and processor time deltas. Configured automatically when observability is enabled.
+`MetricsCollectingExecutionObserver` captures start, completion, retry, circuit-state, and exhausted-retry events with memory and processor-time deltas. It is registered automatically by `AddNPipelineObservability`.

@@ -1,8 +1,8 @@
 ---
 name: npipeline-resilience
-description: Use when the user wants to configure NPipeline error handling, retry strategies, circuit breakers, dead-letter queues, or resilience policies. Covers PipelineRetryOptions, IResiliencePolicy, ResilienceDecision enum, circuit breaker configuration, IDeadLetterSink, node restart, materialization, and the Default/HighThroughput profile retry defaults. Use when user mentions "retry", "error handling", "circuit breaker", "dead letter", "dead-letter queue", "resilience policy", or "node restart".
-npipelineVersion: "0.52.0"
-lastVerified: "2026-06-04"
+description: Use when the user wants to configure NPipeline error handling, retries, circuit breakers, dead-letter queues, or resilience policies. Covers PipelineResilienceOptions (ItemRetry, NodeRestart, NodeRetry, CircuitBreaker), IResiliencePolicy at the three layers, ResilienceDecision, RetryBackoff and RetryClassifier, IDeadLetterSink, and the Default/HighThroughput profile retry defaults. Use when user mentions "retry", "error handling", "circuit breaker", "dead letter", "dead-letter queue", "resilience policy", or "node restart".
+npipelineVersion: "0.67.0"
+lastVerified: "2026-09-29"
 ---
 
 # NPipeline Resilience and Error Handling
@@ -11,57 +11,82 @@ This skill covers NPipeline's resilience subsystem: retries, circuit breakers, r
 
 ## Workflow
 
-When the user wants to handle errors, determine the failure scope (item, node, or pipeline) and choose the appropriate mechanism.
+When the user wants to handle errors, determine the failure scope (item, stream, or node) and choose the appropriate mechanism.
 
 ### Phase 1: Understand the Failure Model
 
-NPipeline has a three-tier failure model:
+NPipeline has a three-layer resilience model:
 
-| Level | Scope | Available Decisions |
-|---|---|---|
-| **Item** | One item fails in a transform | `Retry`, `Skip`, `DeadLetter` |
-| **Node** | Entire node fails (stream error) | `RestartNode`, `ContinueWithoutNode`, `Fail` |
-| **Pipeline** | Critical failure or circuit breaker trips | `Fail` (pipeline stops) |
+| Layer | Option | Applies to | What it repeats | Off by default? |
+|---|---|---|---|---|
+| **L1: item retry** | `ItemRetry` | Transform nodes | One item's `TransformAsync` | No. The `Default` profile retries transient failures three times. |
+| **L2: node restart** | `NodeRestart` | Transform nodes | The node's output stream, resumed from its checkpoint | Yes |
+| **L3: node retry** | `NodeRetry` | Any node | The node's setup, before it reads input | Yes |
 
-Every resilience decision flows through `IResiliencePolicy`. The default policy returns `Fail` for everything — users must opt into recovery.
+All three live on `PipelineResilienceOptions` (`NPipeline.Reliability`). Every decision flows through `IResiliencePolicy`; with no policy registered, `DefaultResiliencePolicy` follows the node's options exactly.
+
+> [!IMPORTANT]
+> Resilience is configured with `builder.WithResilience(o => o with { ... })` over `PipelineResilienceOptions`. `WithRetryOptions`, `PipelineRetryOptions`, and `MaxMaterializedItems` are not part of this API.
 
 ### Phase 2: Configure Retries
 
-The simplest path. Configure per-item retries with optional backoff:
-
 ```csharp
-builder.WithRetryOptions(o => o with { MaxItemRetries = 3 });
+using NPipeline.Reliability;
+
+builder.WithResilience(options => options with
+{
+    ItemRetry = options.ItemRetry with
+    {
+        MaxRetries = 5,
+        Backoff = RetryBackoff.Exponential(TimeSpan.FromMilliseconds(500), maxDelay: TimeSpan.FromSeconds(30)),
+    },
+});
 ```
 
-In `Default` optimization profile, these are auto-configured: 3 retries, exponential backoff + full jitter, 10,000-item materialization cap.
-
-### Phase 3: Add Circuit Breakers (optional)
-
-Prevent cascading failures:
+Under the `Default` optimization profile, transient item failures are already retried three times (`ItemRetryOptions.Default`). `HighThroughput` retries nothing. Per-node:
 
 ```csharp
-builder.WithCircuitBreaker(failureThreshold: 5, openDuration: TimeSpan.FromMinutes(1));
+builder.WithResilience(enrich, options => options with
+{
+    ItemRetry = ItemRetryOptions.Default with { MaxRetries = 10 },
+});
+```
+
+### Phase 3: Add a Circuit Breaker (optional)
+
+```csharp
+using NPipeline.Reliability;
+
+builder.WithResilience(transform, options => options with
+{
+    CircuitBreaker = new CircuitBreakerOptions
+    {
+        ConsecutiveFailures = 5,
+        OpenDuration = TimeSpan.FromSeconds(30),
+    },
+});
 ```
 
 ### Phase 4: Write a Custom Resilience Policy (for advanced cases)
 
-When you need custom decision logic (e.g., different treatment for different exception types):
+When the decision depends on the exception type or item content, derive from `ResiliencePolicyBase` and override only the decisions you care about:
 
 ```csharp
-public class MyPolicy : ResiliencePolicyBase
+using NPipeline.Reliability;
+
+public sealed class DeadLetterInvalidOrders : ResiliencePolicyBase
 {
-    public override async Task<ResilienceDecision> DecideItemFailureAsync<TIn, TOut>(...)
+    public override ValueTask<ResilienceDecision> DecideItemFailureAsync<TIn>(
+        ItemFailure<TIn> failure, CancellationToken cancellationToken)
     {
-        if (exception is TransientException)
-            return ResilienceDecision.Retry;
-        if (exception is ValidationException)
-            return ResilienceDecision.Skip;
-        return ResilienceDecision.DeadLetter;
+        return failure.Exception is ValidationException
+            ? ValueTask.FromResult(ResilienceDecision.DeadLetter)
+            : base.DecideItemFailureAsync(failure, cancellationToken);
     }
 }
 
-builder.AddResiliencePolicy<MyPolicy>();
+builder.AddResiliencePolicy(new DeadLetterInvalidOrders());
 ```
 
-Consult `references/resilience-api.md` for the complete `IResiliencePolicy` interface and `ResilienceDecision` enum.
+Consult `references/resilience-api.md` for the complete `IResiliencePolicy` interface, the failure structs, and `ResilienceDecision`.
 Consult `references/circuit-breaker.md` for circuit breaker configuration details.

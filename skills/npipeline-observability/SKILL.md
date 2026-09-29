@@ -1,8 +1,8 @@
 ---
 name: npipeline-observability
-description: Use when the user wants to add observability to NPipeline pipelines. Covers metrics collection (processed items, durations, throughput), structured logging sinks, per-node timing breakdowns, execution observation, DI setup with AddNPipelineObservability, and OpenTelemetry distributed tracing (ActivitySource integration with Jaeger, Zipkin, Azure Monitor, OTLP exporters). Use when user mentions "metrics", "tracing", "OpenTelemetry", "monitor", "logs", "observe", or "telemetry".
-npipelineVersion: "0.52.0"
-lastVerified: "2026-06-04"
+description: Use when the user wants to add observability to NPipeline pipelines. Covers metrics collection (items in/out, per-node item counts, durations, throughput), structured logging sinks, per-node timing breakdowns, execution observation, DI setup with AddNPipelineObservability and ConfigureNPipelineObservability, AutoObserveAllNodes, and OpenTelemetry distributed tracing (ActivitySource integration with Jaeger, Zipkin, Azure Monitor, OTLP exporters). Use when user mentions "metrics", "tracing", "OpenTelemetry", "monitor", "logs", "observe", or "telemetry".
+npipelineVersion: "0.67.0"
+lastVerified: "2026-09-29"
 ---
 
 # NPipeline Observability
@@ -37,42 +37,47 @@ services.AddNPipelineObservability();
 Enable metrics on individual nodes:
 
 ```csharp
-// In pipeline definition
+// In the pipeline definition
 handle.WithObservability(builder);
 ```
 
-This wraps the node with an `AutoObservabilityScope` that captures:
-- **Work duration** — Time spent in the transform itself
-- **Input wait duration** — Time waiting for input items
-- **Output block duration** — Time blocked on output backpressure
-- **Wall duration** — Total wall-clock time
-- **Throughput** — Items processed per second
+This wraps the node with an `AutoObservabilityScope` that captures work duration, input-wait duration, output-block duration, wall duration, throughput, and item counts.
+
+> [!IMPORTANT]
+> A run under `AddNPipelineObservability` must use a context wired to the container, created with `serviceProvider.CreatePipelineContext(...)` (or `RunPipelineAsync`). A run with `new PipelineContext()` or `PipelineContext.CreateDefault()` has no collector and records nothing; it logs a warning. The same warning is logged for a runner from `PipelineRunner.Create()` whose nodes use `WithObservability`.
 
 ### Phase 2: Choose a Metrics Sink
 
 ```csharp
-// Logging sink (structured logs) — per-node metrics
+// Logging sinks (structured logs) — per-node and pipeline-level
 services.AddNPipelineObservability<LoggingMetricsSink, LoggingPipelineMetricsSink>();
 
-// Custom sinks — specify both per-node and pipeline-level sinks
+// Custom sinks
 services.AddNPipelineObservability<MyMetricsSink, MyPipelineSink>();
 
-// With factory delegate
+// With factory delegates
 services.AddNPipelineObservability(
     sp => new MyMetricsSink(sp.GetRequiredService<ILogger<MyMetricsSink>>()),
     sp => new MyPipelineSink(sp.GetRequiredService<ILogger<MyPipelineSink>>()));
 ```
 
 Built-in sinks:
-- `LoggingMetricsSink` — Logs per-node metrics as structured log events
-- `LoggingPipelineMetricsSink` — Logs overall pipeline metrics (total items, duration, throughput)
+- `LoggingMetricsSink` — logs per-node metrics as structured log events
+- `LoggingPipelineMetricsSink` — logs pipeline items in and out, duration, and throughput
+
+To adjust options whether `AddNPipelineObservability` is called before or after:
+
+```csharp
+services.ConfigureNPipelineObservability(o => o with { AutoObserveAllNodes = true });
+```
+
+`ObservabilityExtensionOptions.AutoObserveAllNodes` (default `false`) observes nodes that were not configured with `WithObservability`. A node's own options take precedence.
 
 ### Phase 3: Add OpenTelemetry Tracing (optional)
 
 ```csharp
 services.AddOpenTelemetryPipelineTracer("order-service");
 
-// Configure exporter
 builder.Services.AddOpenTelemetry()
     .WithTracing(t => t
         .AddNPipelineSource("order-service")
@@ -81,5 +86,5 @@ builder.Services.AddOpenTelemetry()
 
 Supported exporters: Jaeger, Zipkin, Azure Monitor, AWS X-Ray, OTLP (any OTLP-compatible backend).
 
-See `references/metrics-api.md` for detailed metrics and sinks API.
+See `references/metrics-api.md` for the metrics and sinks API.
 See `references/otel-tracing.md` for OpenTelemetry integration and exporter configuration.

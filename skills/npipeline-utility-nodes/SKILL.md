@@ -1,13 +1,13 @@
 ---
 name: npipeline-utility-nodes
 description: Use when the user wants to use NPipeline's built-in utility nodes for common ETL operations. Covers data validation (string, numeric, date, collection), data cleansing, filtering, type conversion, and property enrichment. Use when user mentions "validate data", "cleanse", "filter", "type conversion", "enrich", "data quality", "string validation", "numeric validation", or "deduplicate".
-npipelineVersion: "0.52.0"
-lastVerified: "2026-06-04"
+npipelineVersion: "0.67.0"
+lastVerified: "2026-09-29"
 ---
 
 # NPipeline Utility Nodes
 
-This skill covers `NPipeline.Extensions.Nodes` — a library of pre-built nodes for common data processing tasks: validation, cleansing, filtering, conversion, and enrichment.
+This skill covers `NPipeline.Extensions.Nodes` — pre-built nodes for common data processing tasks: validation, cleansing, filtering, conversion, and enrichment.
 
 ## Package
 
@@ -17,7 +17,7 @@ dotnet add package NPipeline.Extensions.Nodes
 
 ## Workflow
 
-When the user needs data quality or transformation operations, determine which category of operation they need, then guide them to the appropriate node family.
+When the user needs data quality or transformation operations, determine which category they need, then guide them to the appropriate node family.
 
 | User Need | Node Category |
 |---|---|
@@ -27,8 +27,11 @@ When the user needs data quality or transformation operations, determine which c
 | Change data types | Type Conversion |
 | Add computed fields | Enrichment |
 
-See `references/validation-cleansing.md` for validation rules, cleansing operations, and per-type tables.
+See `references/validation-cleansing.md` for the rule tables and per-type method lists.
 See `references/filtering-enrichment.md` for filtering, type conversion, and enrichment APIs.
+
+> [!IMPORTANT]
+> Rules take a property selector as their first argument, e.g. `IsNotEmpty(o => o.CustomerName)`. There is no `ForProperty(...)` wrapper and no `.OnError(...)` method; error decisions are handled by a node-level error handler (see "Error Behavior" below).
 
 ## Quick Examples
 
@@ -36,32 +39,27 @@ See `references/filtering-enrichment.md` for filtering, type conversion, and enr
 
 ```csharp
 builder.AddStringValidation<Order>(cfg => cfg
-    .ForProperty(o => o.CustomerName)
-    .IsNotEmpty()
-    .HasMaxLength(100));
+    .IsNotEmpty(o => o.CustomerName)
+    .HasMaxLength(o => o.CustomerName, 100));
 
 builder.AddNumericValidation<Order>(cfg => cfg
-    .ForProperty(o => o.Amount)
-    .IsPositive()
-    .IsLessThan(10000));
+    .IsPositive(o => o.Amount)
+    .IsLessThan(o => o.Amount, 10_000));
 
 builder.AddDateTimeValidation<Order>(cfg => cfg
-    .ForProperty(o => o.CreatedAt)
-    .IsNotInFuture()
-    .IsUtc());
+    .IsInPast(o => o.CreatedAt)
+    .IsUtc(o => o.CreatedAt));
 ```
 
 ### Cleansing
 
 ```csharp
 builder.AddStringCleansing<Order>(cfg => cfg
-    .ForProperty(o => o.CustomerName)
-    .Trim()
-    .ToTitleCase());
+    .Trim(o => o.CustomerName)
+    .ToTitleCase(o => o.CustomerName));
 
 builder.AddNumericCleansing<Order>(cfg => cfg
-    .ForProperty(o => o.Amount)
-    .Clamp(0, 10000));
+    .Clamp(o => o.Amount, 0m, 10_000m));
 ```
 
 ### Filtering
@@ -75,29 +73,26 @@ builder.AddFilteringNode<Order>(cfg => cfg
 ### Type Conversion
 
 ```csharp
-builder.AddTypeConversion<string, int>("string-to-int");
+builder.AddTypeConversion<string, int>(cfg => cfg
+    .WithConverter(s => int.Parse(s)));
 ```
 
 ### Enrichment
 
 ```csharp
 builder.AddEnrichment<Order>(cfg => cfg
-    .Set(o => o.ProcessedAt, DateTime.UtcNow));
+    .Compute(o => o.TotalAmount, o => o.Amount * o.Quantity));
 ```
 
 ## Error Behavior
 
-Validation and filtering nodes throw typed exceptions with configurable resilience decisions:
+Validation, filtering, and conversion nodes throw typed exceptions:
 
-- `ValidationException` — Item failed validation rules
-- `FilteringException` — Item was filtered out
-- `TypeConversionException` — Conversion failed
+- `ValidationException` — item failed a validation rule
+- `FilteringException` — item did not satisfy the filter
+- `TypeConversionException` — conversion failed
 
-Default handlers return `Fail`. Override to `Skip` or `DeadLetter`:
+The `AddXValidation`, `AddFilteringNode`, and `AddTypeConversion` extension methods attach a default error handler (`DefaultValidationErrorHandler<T>`, `DefaultFilteringErrorHandler<T>`, `DefaultTypeConversionErrorHandler<TIn,TOut>`) to the node via `builder.AddResiliencePolicy(handle, handler)`.
 
-```csharp
-builder.AddStringValidation<Order>(cfg => cfg
-    .ForProperty(o => o.CustomerName)
-    .IsNotEmpty()
-    .OnError(ResilienceDecision.Skip)); // Skip items that fail validation
-```
+- By default that handler returns `Fail`. To skip or dead-letter failing items, pass `applyDefaultErrorHandler: false` and register your own policy, or configure the node's `OnItemFailure` through `builder.WithResilience(...)`.
+- The error handler is a node-scoped `IResiliencePolicy`. See the `npipeline-resilience` skill.
